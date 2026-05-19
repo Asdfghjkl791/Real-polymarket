@@ -1,1 +1,1 @@
-worker: python bot.py
+python delete_api_keys.py
