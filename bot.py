@@ -159,9 +159,15 @@ if balance < 0.5 or not asks:
 
 print("[5/5] Attempting TINY $0.10 test order...")
 print(f"  Asset: BTC 5m UP")
+import math
+# Polymarket: cost max 2 decimals, shares max 4 decimals
+ask_price = round(ask_price, 2)
+shares = math.floor((0.10 / ask_price) * 100) / 100
+if shares * ask_price > 0.10:
+    shares -= 0.01
+shares = round(shares, 2)
 print(f"  Price: {ask_price*100:.1f}¢")
 print(f"  Size: ${0.10}")
-shares = round(0.10 / ask_price, 4)
 print(f"  Shares: {shares}")
 
 try:
