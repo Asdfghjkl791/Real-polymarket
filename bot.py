@@ -78,8 +78,8 @@ try:
         bal_raw = getattr(bal_resp, "balance", 0)
     balance = float(bal_raw) / 1_000_000
     print(f"  ✅ Balance: ${balance:.2f}")
-    if balance < 0.5:
-        print(f"  ⚠️ WARNING: Balance below $0.50, can't test trade")
+    if balance < 1.0:
+        print(f"  ⚠️ WARNING: Balance below $1.00, can't test trade (min order $1)")
 except Exception as e:
     print(f"  ❌ Failed: {e}")
     sys.exit(1)
@@ -153,21 +153,22 @@ except Exception as e:
 print()
 
 # Step 5: Try a tiny test order
-if balance < 0.5 or not asks:
-    print("[5/5] SKIPPING test order (balance too low or no asks)")
+if balance < 1.0 or not asks:
+    print("[5/5] SKIPPING test order (balance below $1 or no asks)")
     sys.exit(0)
 
-print("[5/5] Attempting TINY $0.10 test order...")
+print("[5/5] Attempting TINY $1.00 test order...")
 print(f"  Asset: BTC 5m UP")
 import math
-# Polymarket: cost max 2 decimals, shares max 4 decimals
+# Polymarket: cost max 2 decimals, shares max 4 decimals, minimum $1 order
+test_size = 1.00
 ask_price = round(ask_price, 2)
-shares = math.floor((0.10 / ask_price) * 100) / 100
-if shares * ask_price > 0.10:
+shares = math.floor((test_size / ask_price) * 100) / 100
+if shares * ask_price > test_size:
     shares -= 0.01
 shares = round(shares, 2)
 print(f"  Price: {ask_price*100:.1f}¢")
-print(f"  Size: ${0.10}")
+print(f"  Size: ${test_size}")
 print(f"  Shares: {shares}")
 
 try:
