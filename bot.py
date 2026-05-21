@@ -180,7 +180,7 @@ try:
     resp = client.create_and_post_order(
         order_args,
         options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
-        order_type=OrderType.FOK,
+        order_type=OrderType.GTC,  # GTC has more flexible precision than FOK
     )
     print(f"  Response: {resp}")
     if isinstance(resp, dict):
