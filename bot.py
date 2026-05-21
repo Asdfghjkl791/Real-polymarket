@@ -764,7 +764,23 @@ def place_order(asset, tf, direction, bet_size, open_time):
                 "entry_cents": entry_cents,
             }
 
-        shares = round(bet_size / best_ask, 4)
+        # Polymarket API decimal precision rules:
+        # - Maker amount (cost in USDC): max 2 decimal places
+        # - Taker amount (shares): max 4 decimal places
+        # We round shares to match these constraints.
+        # Round shares DOWN to avoid spending more than bet_size
+        import math
+        # Round price to 2 decimals (cents)
+        best_ask = round(best_ask, 2)
+        # Calculate shares such that bet_size = shares * best_ask is clean
+        # Trying to keep cost at exactly bet_size (rounded to 2 decimals)
+        shares = math.floor((bet_size / best_ask) * 100) / 100  # 2 decimal places
+        # Make sure we don't exceed bet_size
+        if shares * best_ask > bet_size:
+            shares -= 0.01
+        shares = round(shares, 2)
+        if shares < 0.01:
+            return {"status": "failed", "error": f"Calculated shares too small: {shares}"}
 
         if SIGNALS_ONLY_MODE:
             # Build market URL for manual trading
@@ -779,31 +795,48 @@ def place_order(asset, tf, direction, bet_size, open_time):
                 "order_id": "SIGNAL_ONLY",
             }
 
-        # === REAL ORDER PLACEMENT (currently disabled while Polymarket fixes bug) ===
-        order_args = OrderArgs(
+        # === REAL ORDER PLACEMENT ===
+        # Use MarketOrderArgs with amount (USDC) instead of size (shares).
+        # This lets the SDK handle all decimal precision internally.
+        # FAK (Fill-And-Kill) allows partial fills, more forgiving than FOK.
+        from py_clob_client_v2 import MarketOrderArgs
+        order_args = MarketOrderArgs(
             token_id=token_id,
-            price=best_ask,
-            size=shares,
+            amount=bet_size,  # USDC amount, not shares
             side=BUY,
+            order_type=OrderType.FAK,
         )
-        resp = clob_client.create_and_post_order(
-            order_args,
+        resp = clob_client.create_and_post_market_order(
+            order_args=order_args,
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
-            order_type=OrderType.FOK,
+            order_type=OrderType.FAK,
         )
         log.info(f"Order response: {resp}")
 
         success = False
+        actual_shares = shares  # default to estimated
+        actual_cost = bet_size  # default to estimated
         if isinstance(resp, dict):
             success = resp.get("success", False) or resp.get("status") == "matched"
             order_id = resp.get("orderID") or resp.get("orderId", "unknown")
+            # Get ACTUAL fill amounts from Polymarket response
+            if "takingAmount" in resp:
+                try:
+                    actual_shares = float(resp["takingAmount"])
+                except:
+                    pass
+            if "makingAmount" in resp:
+                try:
+                    actual_cost = float(resp["makingAmount"])
+                except:
+                    pass
         else:
             success = getattr(resp, "success", False)
             order_id = getattr(resp, "orderID", "unknown")
 
         return {
             "status": "filled" if success else "failed",
-            "shares": shares,
+            "shares": actual_shares,
             "entry_cents": best_ask * 100,
             "order_id": order_id,
             "raw": str(resp)[:200],
@@ -852,18 +885,28 @@ def process_tick():
             if w["traded"] or w["skipped"]:
                 continue
 
-            # Per-asset-per-tf entry window (ETH 5m is tighter)
+            # Per-asset-per-tf entry window (ETH/BNB/SOL 5m are tighter)
             entry_window = CONFIG["entry_window_seconds"]
-            if asset == "ETH" and tf == 5:
-                entry_window = int(os.environ.get("ENTRY_SECS_ETH_5", "40"))
+            if tf == 5:
+                if asset == "ETH":
+                    entry_window = int(os.environ.get("ENTRY_SECS_ETH_5", "40"))
+                elif asset == "BNB":
+                    entry_window = int(os.environ.get("ENTRY_SECS_BNB_5", "40"))
+                elif asset == "SOL":
+                    entry_window = int(os.environ.get("ENTRY_SECS_SOL_5", "40"))
 
             if secs_left <= 0 or secs_left > entry_window:
                 continue
 
-            # Per-asset threshold override (ETH 5m needs stronger moves)
+            # Per-asset threshold override (ETH/BNB/SOL 5m need stronger moves)
             effective_threshold = threshold
-            if asset == "ETH" and tf == 5:
-                effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.13"))
+            if tf == 5:
+                if asset == "ETH":
+                    effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.13"))
+                elif asset == "BNB":
+                    effective_threshold = float(os.environ.get("THRESHOLD_BNB_5_STRICT", "0.15"))
+                elif asset == "SOL":
+                    effective_threshold = float(os.environ.get("THRESHOLD_SOL_5_STRICT", "0.18"))
 
             if absp < effective_threshold:
                 continue
@@ -915,9 +958,9 @@ def process_tick():
                 weakening_tolerance_map = {
                     "BTC":  float(os.environ.get("WEAKENING_TOLERANCE_BTC",  "0.05")),
                     "ETH":  float(os.environ.get("WEAKENING_TOLERANCE_ETH",  "0.025")),
-                    "SOL":  float(os.environ.get("WEAKENING_TOLERANCE_SOL",  "0.05")),
+                    "SOL":  float(os.environ.get("WEAKENING_TOLERANCE_SOL",  "0.025")),
                     "DOGE": float(os.environ.get("WEAKENING_TOLERANCE_DOGE", "0.05")),
-                    "BNB":  float(os.environ.get("WEAKENING_TOLERANCE_BNB",  "0.05")),
+                    "BNB":  float(os.environ.get("WEAKENING_TOLERANCE_BNB",  "0.025")),
                 }
                 weakening_tolerance = weakening_tolerance_map.get(asset, 0.05)
                 if len(hist) >= 30:
@@ -1395,11 +1438,14 @@ def main():
     mode_str = "🚨 SIGNALS-ONLY" if SIGNALS_ONLY_MODE else "🤖 AUTO-TRADING"
 
     tg(
-        f"🚀 <b>PolySniper LIVE v4.0</b>\n"
-        f"{mode_str}\n\n"
+        f"🚀 <b>PolySniper LIVE v4.1</b>\n"
+        f"{mode_str}\n"
+        f"🎯 <b>EARLY ENTRY STRATEGY</b>\n\n"
         f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
+        f"⏰ Entry window: last {CONFIG['entry_window_seconds']}s\n"
+        f"💲 Entry range: {CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢\n"
         f"🛑 Stop loss: {CONFIG['stop_loss_cents']:.0f}¢\n"
         f"⏸ Auto-pause after: {CONFIG['consecutive_loss_limit']} losses\n"
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n"
