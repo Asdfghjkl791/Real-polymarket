@@ -157,31 +157,24 @@ if balance < 1.0 or not asks:
     print("[5/5] SKIPPING test order (balance below $1 or no asks)")
     sys.exit(0)
 
-print("[5/5] Attempting TINY $1.00 test order...")
+print("[5/5] Attempting $1.00 MARKET BUY order...")
 print(f"  Asset: BTC 5m UP")
-import math
-# Polymarket: cost max 2 decimals, shares max 4 decimals, minimum $1 order
-test_size = 1.00
-ask_price = round(ask_price, 2)
-shares = math.floor((test_size / ask_price) * 100) / 100
-if shares * ask_price > test_size:
-    shares -= 0.01
-shares = round(shares, 2)
-print(f"  Price: {ask_price*100:.1f}¢")
-print(f"  Size: ${test_size}")
-print(f"  Shares: {shares}")
+test_amount = 1.00  # USDC to spend
+print(f"  Price ceiling: {round(ask_price, 2)*100:.1f}¢ (slippage protection)")
+print(f"  Amount: ${test_amount} USDC")
 
 try:
-    order_args = OrderArgs(
+    from py_clob_client_v2 import MarketOrderArgs
+    order_args = MarketOrderArgs(
         token_id=up_token,
-        price=ask_price,
-        size=shares,
+        amount=test_amount,  # USDC, not shares
         side=BUY,
+        order_type=OrderType.FOK,
     )
-    resp = client.create_and_post_order(
-        order_args,
+    resp = client.create_and_post_market_order(
+        order_args=order_args,
         options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
-        order_type=OrderType.GTC,  # GTC has more flexible precision than FOK
+        order_type=OrderType.FOK,
     )
     print(f"  Response: {resp}")
     if isinstance(resp, dict):
