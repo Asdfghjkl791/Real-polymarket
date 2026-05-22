@@ -58,8 +58,8 @@ ASSET_THRESHOLDS_15 = {
     "BNB":  float(os.environ.get("THRESHOLD_BNB_15", "0.25")),
 }
 
-MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "20"))
-MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
+MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "30"))
+MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "50"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
@@ -904,7 +904,7 @@ def process_tick():
                 if asset == "ETH":
                     effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.13"))
                 elif asset == "BNB":
-                    effective_threshold = float(os.environ.get("THRESHOLD_BNB_5_STRICT", "0.15"))
+                    effective_threshold = float(os.environ.get("THRESHOLD_BNB_5_STRICT", "0.18"))
                 elif asset == "SOL":
                     effective_threshold = float(os.environ.get("THRESHOLD_SOL_5_STRICT", "0.18"))
 
