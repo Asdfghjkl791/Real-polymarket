@@ -982,12 +982,16 @@ def process_tick():
                         continue
 
             # Choppy filter: skip if too many reversals in last 30 seconds
-            if recent_revs >= CONFIG["choppy_threshold"]:
+            # ETH gets a tighter threshold (15) than others (20 default)
+            choppy_limit = CONFIG["choppy_threshold"]
+            if asset == "ETH":
+                choppy_limit = int(os.environ.get("CHOPPY_THRESHOLD_ETH", "15"))
+            if recent_revs >= choppy_limit:
                 w["skipped"] = True
                 tg(
                     f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
                     f"📈 Move: {pct:+.3f}%\n"
-                    f"🌪 Reason: Too choppy ({recent_revs}/{CONFIG['choppy_threshold']} reversals in 30s)\n"
+                    f"🌪 Reason: Too choppy ({recent_revs}/{choppy_limit} reversals in 30s)\n"
                     f"⏱ {secs_left}s left"
                 )
                 log.info(f"Skipped {asset} {tf}m {dirn} - too choppy ({recent_revs} reversals in 30s)")
