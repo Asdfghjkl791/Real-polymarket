@@ -727,23 +727,15 @@ def place_order(asset, tf, direction, bet_size, open_time):
     token_id = up_token if direction == "UP" else down_token
 
     try:
-        order_book = clob_client.get_order_book(token_id)
-        if not order_book:
-            return {"status": "failed", "error": "No order book"}
-
-        if isinstance(order_book, dict):
-            asks = order_book.get("asks", [])
+        # Use get_price() not get_order_book() - the book endpoint returns
+        # stale "ghost" data (always shows 99¢/1¢). get_price returns the
+        # actual current ask price. (Known SDK bug in py-clob-client)
+        # side="SELL" gives the ask (what we'd PAY to buy)
+        price_resp = clob_client.get_price(token_id, side="SELL")
+        if isinstance(price_resp, dict):
+            best_ask = float(price_resp.get("price", 0))
         else:
-            asks = getattr(order_book, "asks", [])
-
-        if not asks:
-            return {"status": "failed", "error": "Empty order book"}
-
-        first_ask = asks[0]
-        if isinstance(first_ask, dict):
-            best_ask = float(first_ask.get("price", 0))
-        else:
-            best_ask = float(getattr(first_ask, "price", 0))
+            best_ask = float(price_resp)
 
         if best_ask <= 0:
             return {"status": "failed", "error": "Invalid ask price"}
@@ -834,10 +826,16 @@ def place_order(asset, tf, direction, bet_size, open_time):
             success = getattr(resp, "success", False)
             order_id = getattr(resp, "orderID", "unknown")
 
+        # Calculate REAL entry price from actual fill (not pre-trade ask)
+        if actual_shares > 0 and actual_cost > 0:
+            real_entry_cents = (actual_cost / actual_shares) * 100
+        else:
+            real_entry_cents = best_ask * 100
+
         return {
             "status": "filled" if success else "failed",
             "shares": actual_shares,
-            "entry_cents": best_ask * 100,
+            "entry_cents": real_entry_cents,
             "order_id": order_id,
             "raw": str(resp)[:200],
         }
