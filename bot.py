@@ -836,6 +836,7 @@ def place_order(asset, tf, direction, bet_size, open_time):
             "status": "filled" if success else "failed",
             "shares": actual_shares,
             "entry_cents": real_entry_cents,
+            "actual_cost": actual_cost,
             "order_id": order_id,
             "raw": str(resp)[:200],
         }
@@ -1059,12 +1060,17 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
     if result["status"] == "filled":
         w["traded"] = True
         now = datetime.now(timezone.utc)
+        # Use ACTUAL cost from the fill (partial fills cost less than intended bet).
+        # This keeps PnL accurate - otherwise a partially-filled win looks like a loss.
+        actual_cost = result.get("actual_cost", bet)
+        if actual_cost <= 0:
+            actual_cost = bet
         trade = {
             "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
             "direction": dirn, "pct_move": round(pct, 4),
             "open_price": w["open_price"], "entry_price": price,
             "real_entry_cents": round(result["entry_cents"], 1),
-            "shares": result["shares"], "cost": bet,
+            "shares": result["shares"], "cost": actual_cost,
             "order_id": result["order_id"],
             "window_open": open_time.isoformat(),
             "window_close": close_time.isoformat(),
@@ -1072,7 +1078,7 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
         db_id = db_insert_trade(trade)
         w["trade_db_id"] = db_id
         w["direction"] = dirn
-        state["balance_usd"] -= bet
+        state["balance_usd"] -= actual_cost
         state["trades_today"] += 1
         active_directions[(asset, tf)] = dirn
 
