@@ -69,7 +69,7 @@ CONFIG = {
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
     "price_interval_secs":  5,
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
-    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "85.0")),
+    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "90.0")),
     "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.9")),
     "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "20")),
     "stop_loss_cents":      float(os.environ.get("STOP_LOSS_CENTS", "50.0")),
