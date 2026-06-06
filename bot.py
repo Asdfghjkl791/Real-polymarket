@@ -76,6 +76,9 @@ CONFIG = {
     "stop_loss_check_secs": int(os.environ.get("STOP_LOSS_CHECK_SECS", "10")),
     "stop_loss_discount":   float(os.environ.get("STOP_LOSS_DISCOUNT", "0.05")),
     "consecutive_loss_limit": int(os.environ.get("CONSECUTIVE_LOSS_LIMIT", "2")),
+    # One-asset-at-a-time: if true, block entering a new asset while a DIFFERENT
+    # asset has an open position. Same asset on 5m + 15m together is still allowed.
+    "one_asset_at_a_time": os.environ.get("ONE_ASSET_AT_A_TIME", "true").lower() == "true",
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡", "BNB": "🟨"}
@@ -927,6 +930,16 @@ def process_tick():
             if not corr_ok:
                 w["skipped"] = True
                 continue
+
+            # One-asset-at-a-time limit: block if a DIFFERENT asset has an open
+            # position. Same asset on the other timeframe (5m/15m) is allowed.
+            # Caps simultaneous exposure during correlated/volatile markets.
+            if CONFIG["one_asset_at_a_time"]:
+                open_assets = {a for (a, _tf) in active_directions.keys()}
+                if open_assets and asset not in open_assets:
+                    w["skipped"] = True
+                    log.info(f"Skipped {asset} {tf}m - another asset already open: {open_assets}")
+                    continue
 
             hist = price_histories[ws_key]
             revs = count_reversals(hist)
