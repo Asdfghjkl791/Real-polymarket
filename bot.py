@@ -787,39 +787,6 @@ def place_order(asset, tf, direction, bet_size, open_time):
             }
 
         if entry_cents > CONFIG["max_entry_cents"]:
-            # DIAGNOSTIC: get_price said the ask is at/above the ceiling (often 100¢).
-            # Fetch the RAW order book to see if the book is genuinely empty on the
-            # ask side (real wall) or whether get_price is misreading a book that
-            # actually has shares available (a fetch flaw). Logs both sides.
-            try:
-                ob = clob_client.get_order_book(token_id)
-                if isinstance(ob, dict):
-                    raw_asks = ob.get("asks", [])
-                    raw_bids = ob.get("bids", [])
-                else:
-                    raw_asks = getattr(ob, "asks", [])
-                    raw_bids = getattr(ob, "bids", [])
-                def _top(levels, n=3):
-                    out = []
-                    for lvl in levels[:n]:
-                        if isinstance(lvl, dict):
-                            out.append(f"{float(lvl.get('price',0))*100:.1f}c x{lvl.get('size','?')}")
-                        else:
-                            out.append(f"{float(getattr(lvl,'price',0))*100:.1f}c x{getattr(lvl,'size','?')}")
-                    return out or ["(empty)"]
-                log.info(
-                    f"[BOOK DEBUG] {asset} {tf}m {direction} get_price=SELL {entry_cents:.1f}c | "
-                    f"raw_asks={_top(raw_asks)} | raw_bids={_top(raw_bids)}"
-                )
-                tg(
-                    f"🔎 <b>BOOK DEBUG · {asset} {tf}m {direction}</b>\n\n"
-                    f"get_price ask: <b>{entry_cents:.1f}¢</b>\n"
-                    f"Raw asks: {', '.join(_top(raw_asks))}\n"
-                    f"Raw bids: {', '.join(_top(raw_bids))}"
-                )
-            except Exception as e:
-                log.info(f"[BOOK DEBUG] {asset} {tf}m {direction} get_price={entry_cents:.1f}c | order_book fetch failed: {e}")
-
             return {
                 "status": "skipped",
                 "error": f"Ask {entry_cents:.1f}¢ > max {CONFIG['max_entry_cents']:.0f}¢",
