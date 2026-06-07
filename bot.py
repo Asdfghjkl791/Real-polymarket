@@ -488,33 +488,25 @@ def _extract_latest_value(payload):
 
 def chainlink_websocket_worker(asset):
     """
-    STREAMING MODE: connect once, subscribe, then hold the connection open and
-    consume every tick the feed sends (~1 per second). This captures intra-window
-    movement that the old snapshot-every-5s approach missed.
+    FAST SNAPSHOT MODE: Polymarket's RTDS Chainlink feed is snapshot-on-subscribe —
+    it sends one snapshot of recent ticks when you connect, then goes silent. Holding
+    the connection open gets you nothing further. So to get fresh data we connect,
+    grab the snapshot's newest tick, close, and reconnect on a short cycle.
 
-    Includes a zombie-connection guard: the socket can stay "alive" (ping/pong ok)
-    while price data silently stops. We track the last REAL tick on a monotonic
-    clock and force a reconnect if no real data arrives within ZOMBIE_TIMEOUT.
-
-    NOTE: switching from 5s sampling to ~1s streaming will roughly 5x the reversal
-    counts, so MAX_REVERSALS_5/15 and CHOPPY_THRESHOLD need recalibration after this.
+    RECONNECT_INTERVAL controls how fresh the price is (lower = fresher but more
+    connection load; too low risks rate-limiting/throttling by Polymarket).
     """
     symbol = CHAINLINK_SYMBOLS.get(asset)
     if not symbol:
         return
 
-    ZOMBIE_TIMEOUT = 45  # seconds without a real tick before we force-reconnect.
-    # The feed sends batched messages every ~15-16s (each containing many
-    # per-second ticks), so the timeout must be comfortably longer than that
-    # interval or it false-fires and reconnects on every healthy connection.
+    RECONNECT_INTERVAL = float(os.environ.get("CL_RECONNECT_SECS", "1.0"))
 
     while True:
         ws = None
-        last_real_tick = time.monotonic()
         try:
-            log.info(f"[Chainlink WS] Connecting (stream) for {asset} ({symbol})...")
             ws = websocket.create_connection(CHAINLINK_WS_URL, timeout=10)
-            ws.settimeout(5)  # recv() wakes every 5s even with no data, so we can check the zombie clock
+            ws.settimeout(5)
 
             subscribe_msg = {
                 "action": "subscribe",
@@ -528,42 +520,29 @@ def chainlink_websocket_worker(asset):
             }
             ws.send(json.dumps(subscribe_msg))
 
-            # TEMP DEBUG: log the first 3 raw messages for BTC so we can see the
-            # actual live message format. Remove once the parser is confirmed.
-            debug_count = 0
-
-            # Stream loop: keep the connection open and read ticks as they arrive.
-            while True:
+            # Read until we get the snapshot's price, then move on (up to 5s).
+            connect_time = time.time()
+            got_data = False
+            while time.time() - connect_time < 5:
                 try:
                     msg = ws.recv()
                     if not msg:
-                        if time.monotonic() - last_real_tick > ZOMBIE_TIMEOUT:
-                            log.warning(f"[Chainlink WS] {asset} zombie (empty frames) - reconnecting")
-                            break
                         continue
-
-                    if asset == "BTC" and debug_count < 3:
-                        log.info(f"[Chainlink WS DEBUG] BTC raw msg: {msg[:300]}")
-                        debug_count += 1
-
                     data = json.loads(msg)
                     value = _extract_latest_value(data.get("payload", {}))
                     if value is not None:
                         prices_chainlink[asset] = value
                         chainlink_last_update[asset] = time.time()
-                        last_real_tick = time.monotonic()
-                    # else: heartbeat / non-price message - ignore, don't reset clock
-
-                except websocket.WebSocketTimeoutException:
-                    # No message in the last 5s. Heartbeat frames could still arrive
-                    # on a zombie connection, so rely on last_real_tick, not recv().
-                    if time.monotonic() - last_real_tick > ZOMBIE_TIMEOUT:
-                        log.warning(f"[Chainlink WS] {asset} zombie (no real ticks {ZOMBIE_TIMEOUT}s) - reconnecting")
+                        got_data = True
                         break
-                    continue
-                except Exception as e:
-                    log.warning(f"[Chainlink WS] {asset} stream recv error: {e}")
+                except websocket.WebSocketTimeoutException:
                     break
+                except Exception as e:
+                    log.warning(f"[Chainlink WS] {asset} recv error: {e}")
+                    break
+
+            if not got_data:
+                log.warning(f"[Chainlink WS] {asset} no data in snapshot")
 
         except Exception as e:
             log.error(f"[Chainlink WS] {asset} connection error: {e}")
@@ -574,8 +553,9 @@ def chainlink_websocket_worker(asset):
             except:
                 pass
 
-        # Brief pause before reconnecting (avoids hammering on repeated failures).
-        time.sleep(1)
+        # Short cycle for fresher data. Watch logs for rate-limit/connection errors;
+        # if they appear, raise CL_RECONNECT_SECS (e.g. to 2 or 3).
+        time.sleep(RECONNECT_INTERVAL)
 
 
 def start_chainlink_threads():
