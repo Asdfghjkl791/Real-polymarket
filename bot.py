@@ -61,11 +61,12 @@ ASSET_THRESHOLDS_15 = {
 MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "35"))
 MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "50"))
 
-# Deadband: ignore price wiggles smaller than this % when counting reversals, so
-# tiny per-second jitter doesn't get counted as a real direction change.
-# 0 = OFF (count every change, original behavior). Try 0.02-0.03 to filter noise.
-# Tune from the logs: watch window_revs/30s_revs, adjust until it reflects real chop.
-REVERSAL_DEADBAND_PCT = float(os.environ.get("REVERSAL_DEADBAND_PCT", "0.0"))
+# Volatility filter (separate from reversals): measures average per-second % move
+# over the last 30s — how "jumpy" the market is, regardless of direction.
+# MAX_VOLATILITY_PCT = 0 means MEASURE-ONLY (logs the number, never skips).
+# Set it to a value (e.g. 0.015) later to start skipping windows jumpier than that.
+# The volatility is always logged so you can collect real numbers before choosing.
+MAX_VOLATILITY_PCT = float(os.environ.get("MAX_VOLATILITY_PCT", "0.0"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
@@ -631,10 +632,6 @@ def count_reversals(hist):
     for i in range(1, len(pl)):
         d = pl[i] - pl[i-1]
         if d == 0: continue
-        # Deadband: ignore steps smaller than REVERSAL_DEADBAND_PCT of the price.
-        if REVERSAL_DEADBAND_PCT > 0 and pl[i-1] > 0:
-            if abs(d) / pl[i-1] * 100 < REVERSAL_DEADBAND_PCT:
-                continue
         cur = "up" if d > 0 else "dn"
         if prev and cur != prev: revs += 1
         prev = cur
@@ -652,14 +649,31 @@ def count_reversals_recent(hist, seconds=30):
     for i in range(1, len(recent)):
         d = recent[i] - recent[i-1]
         if d == 0: continue
-        # Deadband: ignore steps smaller than REVERSAL_DEADBAND_PCT of the price.
-        if REVERSAL_DEADBAND_PCT > 0 and recent[i-1] > 0:
-            if abs(d) / recent[i-1] * 100 < REVERSAL_DEADBAND_PCT:
-                continue
         cur = "up" if d > 0 else "dn"
         if prev and cur != prev: revs += 1
         prev = cur
     return revs
+
+
+def measure_volatility_pct(hist, seconds=30):
+    """
+    Measure recent 'jumpiness': the average absolute per-second price move over the
+    last N seconds, expressed as a % of price. Direction-agnostic — just how much
+    the price is moving each second. High value = jumpy/unstable market.
+    Returns 0.0 if not enough history.
+    """
+    if len(hist) < 3:
+        return 0.0
+    recent = list(hist)[-seconds:]
+    if len(recent) < 3:
+        return 0.0
+    total_pct = 0.0
+    count = 0
+    for i in range(1, len(recent)):
+        if recent[i-1] > 0:
+            total_pct += abs(recent[i] - recent[i-1]) / recent[i-1] * 100
+            count += 1
+    return (total_pct / count) if count > 0 else 0.0
 
 
 def check_momentum(hist, direction, n):
@@ -997,8 +1011,23 @@ def process_tick():
             hist = price_histories[ws_key]
             revs = count_reversals(hist)
             recent_revs = count_reversals_recent(hist, seconds=30)
+            volatility = measure_volatility_pct(hist, seconds=30)
             emoji = ASSET_EMOJI.get(asset, "")
             arrow = "🔺" if dirn == "UP" else "🔻"
+
+            # Volatility filter. Always LOG the measured value (data collection).
+            # Only SKIP if MAX_VOLATILITY_PCT > 0 (i.e. you've turned it on).
+            log.info(f"[VOLATILITY] {asset} {tf}m vol={volatility:.4f}%/s (30s) move={pct:+.3f}%")
+            if MAX_VOLATILITY_PCT > 0 and volatility > MAX_VOLATILITY_PCT:
+                w["skipped"] = True
+                tg(
+                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+                    f"📈 Move: {pct:+.3f}%\n"
+                    f"🌊 Reason: Too volatile ({volatility:.4f}%/s > {MAX_VOLATILITY_PCT:.4f}%/s)\n"
+                    f"⏱ {secs_left}s left"
+                )
+                log.info(f"Skipped {asset} {tf}m {dirn} - too volatile ({volatility:.4f}%/s)")
+                continue
 
             if revs > max_revs:
                 w["skipped"] = True
@@ -1063,7 +1092,8 @@ def process_tick():
                 continue
 
             # Log the reversal counts for entered trades (for tuning the choppy threshold)
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%")
+            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, vol={volatility:.4f}%/s")
+            w["entry_volatility"] = volatility
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
@@ -1409,6 +1439,7 @@ def settle(w, asset, tf, close_price):
         "entry_move": w.get("entry_move"),
         "entry_revs": w.get("entry_revs"),
         "entry_recent_revs": w.get("entry_recent_revs"),
+        "entry_volatility": w.get("entry_volatility"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
     t.start()
@@ -1499,9 +1530,13 @@ def _settle_worker(d, asset, tf):
     # Entry conditions captured at trade time (for reviewing what wins/losses looked like)
     cond_lines = ""
     if d.get("entry_move") is not None:
+        vol_str = ""
+        if d.get("entry_volatility") is not None:
+            vol_str = f"🌊 Volatility: {d['entry_volatility']:.4f}%/s\n"
         cond_lines = (
             f"📈 Move: {d['entry_move']:+.3f}%\n"
             f"🔄 Window rev: {d.get('entry_revs','?')} · 30s rev: {d.get('entry_recent_revs','?')}\n"
+            f"{vol_str}"
             f"💲 Entry: {entry_c:.1f}¢\n"
         )
 
