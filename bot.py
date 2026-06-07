@@ -773,6 +773,39 @@ def place_order(asset, tf, direction, bet_size, open_time):
             }
 
         if entry_cents > CONFIG["max_entry_cents"]:
+            # DIAGNOSTIC: get_price said the ask is at/above the ceiling (often 100¢).
+            # Fetch the RAW order book to see if the book is genuinely empty on the
+            # ask side (real wall) or whether get_price is misreading a book that
+            # actually has shares available (a fetch flaw). Logs both sides.
+            try:
+                ob = clob_client.get_order_book(token_id)
+                if isinstance(ob, dict):
+                    raw_asks = ob.get("asks", [])
+                    raw_bids = ob.get("bids", [])
+                else:
+                    raw_asks = getattr(ob, "asks", [])
+                    raw_bids = getattr(ob, "bids", [])
+                def _top(levels, n=3):
+                    out = []
+                    for lvl in levels[:n]:
+                        if isinstance(lvl, dict):
+                            out.append(f"{float(lvl.get('price',0))*100:.1f}c x{lvl.get('size','?')}")
+                        else:
+                            out.append(f"{float(getattr(lvl,'price',0))*100:.1f}c x{getattr(lvl,'size','?')}")
+                    return out or ["(empty)"]
+                log.info(
+                    f"[BOOK DEBUG] {asset} {tf}m {direction} get_price=SELL {entry_cents:.1f}c | "
+                    f"raw_asks={_top(raw_asks)} | raw_bids={_top(raw_bids)}"
+                )
+                tg(
+                    f"🔎 <b>BOOK DEBUG · {asset} {tf}m {direction}</b>\n\n"
+                    f"get_price ask: <b>{entry_cents:.1f}¢</b>\n"
+                    f"Raw asks: {', '.join(_top(raw_asks))}\n"
+                    f"Raw bids: {', '.join(_top(raw_bids))}"
+                )
+            except Exception as e:
+                log.info(f"[BOOK DEBUG] {asset} {tf}m {direction} get_price={entry_cents:.1f}c | order_book fetch failed: {e}")
+
             return {
                 "status": "skipped",
                 "error": f"Ask {entry_cents:.1f}¢ > max {CONFIG['max_entry_cents']:.0f}¢",
@@ -1111,6 +1144,10 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
         db_id = db_insert_trade(trade)
         w["trade_db_id"] = db_id
         w["direction"] = dirn
+        # Stash entry conditions so the settlement message can show them.
+        w["entry_move"] = pct
+        w["entry_revs"] = revs
+        w["entry_recent_revs"] = recent_revs
         state["balance_usd"] -= actual_cost
         state["trades_today"] += 1
         active_directions[(asset, tf)] = dirn
@@ -1369,6 +1406,9 @@ def settle(w, asset, tf, close_price):
         "open_time": w["open_time"],
         "open_price": w["open_price"],
         "close_price": close_price,
+        "entry_move": w.get("entry_move"),
+        "entry_revs": w.get("entry_revs"),
+        "entry_recent_revs": w.get("entry_recent_revs"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
     t.start()
@@ -1456,9 +1496,19 @@ def _settle_worker(d, asset, tf):
     emoji = ASSET_EMOJI.get(asset, "")
     out_emoji = "✅" if won else "❌"
 
+    # Entry conditions captured at trade time (for reviewing what wins/losses looked like)
+    cond_lines = ""
+    if d.get("entry_move") is not None:
+        cond_lines = (
+            f"📈 Move: {d['entry_move']:+.3f}%\n"
+            f"🔄 Window rev: {d.get('entry_revs','?')} · 30s rev: {d.get('entry_recent_revs','?')}\n"
+            f"💲 Entry: {entry_c:.1f}¢\n"
+        )
+
     tg(
         f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
         f"Called: {d['direction']} · Actual: {actual}\n"
+        f"{cond_lines}"
         f"<i>Source: {source}</i>\n"
         f"PnL: <b>${pl:+.3f}</b> · Bal: ${state['balance_usd']:.2f}\n"
         f"📊 {total} · {wr} · ${total_pnl:+.2f}"
