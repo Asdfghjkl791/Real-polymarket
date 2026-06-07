@@ -525,6 +525,10 @@ def chainlink_websocket_worker(asset):
             }
             ws.send(json.dumps(subscribe_msg))
 
+            # TEMP DEBUG: log the first 3 raw messages for BTC so we can see the
+            # actual live message format. Remove once the parser is confirmed.
+            debug_count = 0
+
             # Stream loop: keep the connection open and read ticks as they arrive.
             while True:
                 try:
@@ -534,6 +538,10 @@ def chainlink_websocket_worker(asset):
                             log.warning(f"[Chainlink WS] {asset} zombie (empty frames) - reconnecting")
                             break
                         continue
+
+                    if asset == "BTC" and debug_count < 3:
+                        log.info(f"[Chainlink WS DEBUG] BTC raw msg: {msg[:300]}")
+                        debug_count += 1
 
                     data = json.loads(msg)
                     value = _extract_latest_value(data.get("payload", {}))
