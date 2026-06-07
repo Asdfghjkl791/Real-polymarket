@@ -503,7 +503,10 @@ def chainlink_websocket_worker(asset):
     if not symbol:
         return
 
-    ZOMBIE_TIMEOUT = 15  # seconds without a real tick before we force-reconnect
+    ZOMBIE_TIMEOUT = 45  # seconds without a real tick before we force-reconnect.
+    # The feed sends batched messages every ~15-16s (each containing many
+    # per-second ticks), so the timeout must be comfortably longer than that
+    # interval or it false-fires and reconnects on every healthy connection.
 
     while True:
         ws = None
