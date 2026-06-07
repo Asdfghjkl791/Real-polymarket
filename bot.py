@@ -1508,6 +1508,11 @@ def main():
     last_prices_time = startup_time  # Initialize to startup time, not 0, so we don't fire false warnings
     grace_period = 60  # Don't fire "feed down" warnings for first 60s after startup
 
+    # Heartbeat: periodically log current prices + how stale each is, so you can
+    # SEE the feed working. Interval configurable via HEARTBEAT_SECS (0 = off).
+    heartbeat_secs = int(os.environ.get("HEARTBEAT_SECS", "10"))
+    last_heartbeat = 0
+
     while True:
         try:
             now = time.time()
@@ -1529,6 +1534,19 @@ def main():
             handle_commands()
             if prices and not state["paused"]:
                 process_tick()
+
+            # Heartbeat: log current prices + staleness so the feed is visible.
+            if heartbeat_secs > 0 and now - last_heartbeat >= heartbeat_secs:
+                parts = []
+                for a in ASSET_LIST:
+                    p = prices.get(a)
+                    if p is None:
+                        parts.append(f"{a}=--")
+                    else:
+                        age = now - chainlink_last_update.get(a, now)
+                        parts.append(f"{a}={p:g}({age:.0f}s)")
+                log.info("[Heartbeat] " + "  ".join(parts))
+                last_heartbeat = now
 
             # Periodic balance refresh
             if now - state["last_balance_check"] > 300:
