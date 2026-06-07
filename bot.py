@@ -58,8 +58,14 @@ ASSET_THRESHOLDS_15 = {
     "BNB":  float(os.environ.get("THRESHOLD_BNB_15", "0.25")),
 }
 
-MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "30"))
+MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "35"))
 MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "50"))
+
+# Deadband: ignore price wiggles smaller than this % when counting reversals, so
+# tiny per-second jitter doesn't get counted as a real direction change.
+# 0 = OFF (count every change, original behavior). Try 0.02-0.03 to filter noise.
+# Tune from the logs: watch window_revs/30s_revs, adjust until it reflects real chop.
+REVERSAL_DEADBAND_PCT = float(os.environ.get("REVERSAL_DEADBAND_PCT", "0.0"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
@@ -625,6 +631,10 @@ def count_reversals(hist):
     for i in range(1, len(pl)):
         d = pl[i] - pl[i-1]
         if d == 0: continue
+        # Deadband: ignore steps smaller than REVERSAL_DEADBAND_PCT of the price.
+        if REVERSAL_DEADBAND_PCT > 0 and pl[i-1] > 0:
+            if abs(d) / pl[i-1] * 100 < REVERSAL_DEADBAND_PCT:
+                continue
         cur = "up" if d > 0 else "dn"
         if prev and cur != prev: revs += 1
         prev = cur
@@ -642,6 +652,10 @@ def count_reversals_recent(hist, seconds=30):
     for i in range(1, len(recent)):
         d = recent[i] - recent[i-1]
         if d == 0: continue
+        # Deadband: ignore steps smaller than REVERSAL_DEADBAND_PCT of the price.
+        if REVERSAL_DEADBAND_PCT > 0 and recent[i-1] > 0:
+            if abs(d) / recent[i-1] * 100 < REVERSAL_DEADBAND_PCT:
+                continue
         cur = "up" if d > 0 else "dn"
         if prev and cur != prev: revs += 1
         prev = cur
