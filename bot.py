@@ -676,6 +676,37 @@ def measure_volatility_pct(hist, seconds=30):
     return (total_pct / count) if count > 0 else 0.0
 
 
+def measure_vol_stats(hist, seconds=30, big_jump_pct=0.02):
+    """
+    Return a dict of volatility statistics over the last N seconds:
+      - net:      net % move start→end (signed; direction of the window)
+      - avg:      average absolute per-second % move
+      - rv:       realized volatility = sqrt(sum of squared per-second % moves)
+      - max:      largest single per-second % move
+      - big:      count of per-second moves bigger than big_jump_pct
+    Used for data collection / analysis (shown on settled trades).
+    """
+    stats = {"net": 0.0, "avg": 0.0, "rv": 0.0, "max": 0.0, "big": 0}
+    if len(hist) < 3:
+        return stats
+    recent = list(hist)[-seconds:]
+    if len(recent) < 3:
+        return stats
+    pct_moves = []
+    for i in range(1, len(recent)):
+        if recent[i-1] > 0:
+            pct_moves.append(abs(recent[i] - recent[i-1]) / recent[i-1] * 100)
+    if not pct_moves:
+        return stats
+    if recent[0] > 0:
+        stats["net"] = (recent[-1] - recent[0]) / recent[0] * 100
+    stats["avg"] = sum(pct_moves) / len(pct_moves)
+    stats["rv"] = (sum(p * p for p in pct_moves)) ** 0.5
+    stats["max"] = max(pct_moves)
+    stats["big"] = sum(1 for p in pct_moves if p > big_jump_pct)
+    return stats
+
+
 def check_momentum(hist, direction, n):
     if len(hist) < n + 1:
         return True
@@ -1059,8 +1090,10 @@ def process_tick():
                 continue
 
             # Log the reversal counts for entered trades (for tuning the choppy threshold)
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, vol={volatility:.4f}%/s")
+            vol_stats = measure_vol_stats(hist, seconds=30)
+            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
             w["entry_volatility"] = volatility
+            w["entry_vol_stats"] = vol_stats
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
@@ -1407,6 +1440,7 @@ def settle(w, asset, tf, close_price):
         "entry_revs": w.get("entry_revs"),
         "entry_recent_revs": w.get("entry_recent_revs"),
         "entry_volatility": w.get("entry_volatility"),
+        "entry_vol_stats": w.get("entry_vol_stats"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
     t.start()
@@ -1498,7 +1532,13 @@ def _settle_worker(d, asset, tf):
     cond_lines = ""
     if d.get("entry_move") is not None:
         vol_str = ""
-        if d.get("entry_volatility") is not None:
+        vs = d.get("entry_vol_stats")
+        if vs:
+            vol_str = (
+                f"🌊 Net: {vs['net']:+.3f}% · Avg: {vs['avg']:.4f}\n"
+                f"🌊 RealizedVol: {vs['rv']:.4f} · BigJumps: {vs['big']}\n"
+            )
+        elif d.get("entry_volatility") is not None:
             vol_str = f"🌊 Volatility: {d['entry_volatility']:.4f}%/s\n"
         cond_lines = (
             f"📈 Move: {d['entry_move']:+.3f}%\n"
