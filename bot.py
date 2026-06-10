@@ -70,6 +70,13 @@ MAX_VOLATILITY_PCT = float(os.environ.get("MAX_VOLATILITY_PCT", "0.0"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
+    # Time-based bet sizing (EST). Day = 6am-9pm, Night = 9pm-6am.
+    # If TIME_BASED_BET is "true", these override bet_size based on the hour.
+    "time_based_bet":       os.environ.get("TIME_BASED_BET", "true").lower() == "true",
+    "bet_size_day":         float(os.environ.get("BET_SIZE_DAY", "2.0")),
+    "bet_size_night":       float(os.environ.get("BET_SIZE_NIGHT", "1.0")),
+    "night_start_hour":     int(os.environ.get("NIGHT_START_HOUR", "21")),  # 9pm EST
+    "night_end_hour":       int(os.environ.get("NIGHT_END_HOUR", "6")),     # 6am EST
     "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "50")),
     "retry_interval_secs":  int(os.environ.get("RETRY_INTERVAL", "5")),
     "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
@@ -89,6 +96,23 @@ CONFIG = {
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡", "BNB": "🟨"}
+
+# Per-asset entry-price range overrides (cents). If an asset is listed here, its
+# min/max override the global CONFIG min_entry_cents/max_entry_cents.
+# SOL: 97-100¢ (set per request). Others fall back to the global range.
+ASSET_ENTRY_RANGE = {
+    "SOL": (
+        float(os.environ.get("MIN_ENTRY_CENTS_SOL", "97.0")),
+        float(os.environ.get("MAX_ENTRY_CENTS_SOL", "100.0")),
+    ),
+}
+
+def entry_range_for(asset):
+    """Return (min_cents, max_cents) for an asset, using per-asset override if set."""
+    if asset in ASSET_ENTRY_RANGE:
+        return ASSET_ENTRY_RANGE[asset]
+    return CONFIG["min_entry_cents"], CONFIG["max_entry_cents"]
+
 
 COINBASE_PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD", "DOGE": "DOGE-USD", "BNB": "BNB-USD"}
 COINGECKO_IDS     = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "DOGE": "dogecoin", "BNB": "binancecoin"}
@@ -140,6 +164,20 @@ market_cache = {}  # cache of slug → token IDs
 # ─── TIME HELPERS ────────────────────────────────────────────────────────────
 def est_now():
     return datetime.now(timezone.utc) - timedelta(hours=4)
+
+def current_bet_size():
+    """
+    Return the bet size for right now. If time-based betting is on, use the
+    day size (6am-9pm EST) or night size (9pm-6am EST). Otherwise the flat bet_size.
+    """
+    if not CONFIG.get("time_based_bet"):
+        return CONFIG["bet_size"]
+    hour = est_now().hour
+    start = CONFIG["night_start_hour"]  # 21 (9pm)
+    end = CONFIG["night_end_hour"]      # 6 (6am)
+    # Night wraps past midnight: hour >= 21 OR hour < 6
+    is_night = (hour >= start) or (hour < end)
+    return CONFIG["bet_size_night"] if is_night else CONFIG["bet_size_day"]
 
 def est_str():
     return est_now().strftime("%H:%M EST")
@@ -810,17 +848,19 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
         entry_cents = best_ask * 100
 
-        if entry_cents < CONFIG["min_entry_cents"]:
+        min_cents, max_cents = entry_range_for(asset)
+
+        if entry_cents < min_cents:
             return {
                 "status": "skipped",
-                "error": f"Ask {entry_cents:.1f}¢ < min {CONFIG['min_entry_cents']:.0f}¢ (market disagrees)",
+                "error": f"Ask {entry_cents:.1f}¢ < min {min_cents:.0f}¢ (market disagrees)",
                 "entry_cents": entry_cents,
             }
 
-        if entry_cents > CONFIG["max_entry_cents"]:
+        if entry_cents > max_cents:
             return {
                 "status": "skipped",
-                "error": f"Ask {entry_cents:.1f}¢ > max {CONFIG['max_entry_cents']:.0f}¢",
+                "error": f"Ask {entry_cents:.1f}¢ > max {max_cents:.0f}¢",
                 "entry_cents": entry_cents,
             }
 
@@ -1098,7 +1138,7 @@ def process_tick():
 
 
 def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs=0, recent_revs=0):
-    bet = min(CONFIG["bet_size"], state["balance_usd"])
+    bet = min(current_bet_size(), state["balance_usd"])
     if bet < CONFIG["min_balance"]:
         return
 
