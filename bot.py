@@ -645,176 +645,6 @@ def fetch_validated_prices():
     return validated
 
 
-# ─── BINANCE LAG MEASUREMENT (measure-only — no trading impact) ──────────────
-# Streams live prices from Binance (a true push stream) and measures how long
-# Polymarket's Chainlink relay takes to reflect meaningful moves. Pure
-# instrumentation: no extra Polymarket API calls, separate daemon threads,
-# cannot affect trading. Per-market hourly summary to Telegram.
-# Toggle with LAG_MEASURE=false.
-LAG_MEASURE        = os.environ.get("LAG_MEASURE", "true").lower() == "true"
-LAG_EVENT_PCT      = float(os.environ.get("LAG_EVENT_PCT", "0.05"))    # min Binance move (%) to count as an event
-LAG_EVENT_WINDOW   = float(os.environ.get("LAG_EVENT_WINDOW", "5"))    # the move must happen within this many seconds
-LAG_EVENT_COOLDOWN = float(os.environ.get("LAG_EVENT_COOLDOWN", "60")) # per-asset gap between events (s)
-LAG_MATCH_FRACTION = float(os.environ.get("LAG_MATCH_FRACTION", "0.5"))# Poly feed must show this fraction of the move
-LAG_MAX_WAIT       = float(os.environ.get("LAG_MAX_WAIT", "30"))       # give up waiting after this many seconds
-LAG_TG_PER_EVENT   = os.environ.get("LAG_TG_PER_EVENT", "false").lower() == "true"
-LAG_REPORT_SECS    = int(os.environ.get("LAG_REPORT_SECS", "3600"))    # hourly summary
-
-BINANCE_WS_URL = "wss://stream.binance.com:9443/stream?streams=" + "/".join(
-    f"{s}@trade" for s in ["btcusdt", "ethusdt", "solusdt", "dogeusdt", "bnbusdt"]
-)
-BINANCE_SYMBOL_TO_ASSET = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL",
-                           "DOGEUSDT": "DOGE", "BNBUSDT": "BNB"}
-
-prices_binance      = {}
-binance_last_update = {}
-_lag_ticks      = {a: deque() for a in ASSET_LIST}   # recent (ts, price) Binance ticks
-_lag_last_event = {a: 0.0 for a in ASSET_LIST}
-_lag_results    = {a: [] for a in ASSET_LIST}        # lag seconds, current report window
-_lag_timeouts   = {a: 0 for a in ASSET_LIST}         # events the feed never matched in time
-_lag_lock       = threading.Lock()
-
-
-def _lag_on_tick(asset, ts, price):
-    """Called on every Binance tick: detect 'events' (fast meaningful moves)."""
-    dq = _lag_ticks[asset]
-    dq.append((ts, price))
-    cutoff = ts - LAG_EVENT_WINDOW
-    while dq and dq[0][0] < cutoff:
-        dq.popleft()
-    if len(dq) < 2:
-        return
-    base_ts, base_price = dq[0]
-    if base_price <= 0:
-        return
-    move_pct = (price - base_price) / base_price * 100
-    if abs(move_pct) < LAG_EVENT_PCT:
-        return
-    if ts - _lag_last_event[asset] < LAG_EVENT_COOLDOWN:
-        return
-    _lag_last_event[asset] = ts
-    cl_start = prices_chainlink.get(asset)
-    if not cl_start:
-        return  # can't measure lag without a Poly feed baseline
-    threading.Thread(target=_lag_watch, args=(asset, ts, move_pct, cl_start), daemon=True).start()
-
-
-def _lag_watch(asset, event_ts, move_pct, cl_start):
-    """Wait for Polymarket's Chainlink relay to reflect the Binance move; record the lag."""
-    try:
-        needed = abs(move_pct) * LAG_MATCH_FRACTION
-        sign = 1 if move_pct > 0 else -1
-        while time.time() - event_ts < LAG_MAX_WAIT:
-            cl_now = prices_chainlink.get(asset)
-            if cl_now and cl_start > 0:
-                cl_move = (cl_now - cl_start) / cl_start * 100
-                if cl_move * sign >= needed:
-                    lag = time.time() - event_ts
-                    with _lag_lock:
-                        _lag_results[asset].append(lag)
-                    log.info(f"[LAG] {asset} Binance {move_pct:+.3f}% -> Poly feed caught up in {lag:.1f}s")
-                    if LAG_TG_PER_EVENT:
-                        tg(
-                            f"⚡ <b>LAG · {ASSET_EMOJI.get(asset,'')} {asset}</b>\n"
-                            f"Binance move: {move_pct:+.3f}%\n"
-                            f"Poly feed caught up in: <b>{lag:.1f}s</b>"
-                        )
-                    return
-            time.sleep(0.2)
-        with _lag_lock:
-            _lag_timeouts[asset] += 1
-        log.info(f"[LAG] {asset} Binance {move_pct:+.3f}% -> feed did NOT catch up within {LAG_MAX_WAIT:.0f}s")
-    except Exception as e:
-        log.warning(f"[LAG] watch error for {asset}: {e}")
-
-
-def binance_ws_worker():
-    """Persistent Binance stream — a true push feed (stays open, sends every trade)."""
-    while True:
-        ws = None
-        try:
-            ws = websocket.create_connection(BINANCE_WS_URL, timeout=10)
-            ws.settimeout(30)
-            log.info("[Binance WS] Connected (lag measurement)")
-            while True:
-                msg = ws.recv()
-                if not msg:
-                    continue
-                data = json.loads(msg)
-                d = data.get("data", {})
-                asset = BINANCE_SYMBOL_TO_ASSET.get(d.get("s", ""))
-                if not asset:
-                    continue
-                price = float(d.get("p", 0))
-                if price <= 0:
-                    continue
-                now = time.time()
-                prices_binance[asset] = price
-                binance_last_update[asset] = now
-                _lag_on_tick(asset, now, price)
-        except Exception as e:
-            log.warning(f"[Binance WS] error: {e} - reconnecting in 3s")
-        finally:
-            try:
-                if ws:
-                    ws.close()
-            except:
-                pass
-        time.sleep(3)
-
-
-def lag_report_worker():
-    """Hourly per-market lag summary to Telegram."""
-    import statistics
-    while True:
-        time.sleep(LAG_REPORT_SECS)
-        try:
-            with _lag_lock:
-                snapshot = {a: list(_lag_results[a]) for a in ASSET_LIST}
-                touts = dict(_lag_timeouts)
-                for a in ASSET_LIST:
-                    _lag_results[a].clear()
-                    _lag_timeouts[a] = 0
-            total = sum(len(v) for v in snapshot.values()) + sum(touts.values())
-            if total == 0:
-                continue  # quiet hour - no message
-            lines = []
-            for a in ASSET_LIST:
-                vals = snapshot[a]
-                t_o = touts.get(a, 0)
-                n = len(vals) + t_o
-                em = ASSET_EMOJI.get(a, "")
-                if n == 0:
-                    lines.append(f"{em} {a} · no events")
-                elif vals:
-                    med = statistics.median(vals)
-                    over2 = sum(1 for v in vals if v > 2) / len(vals) * 100
-                    lines.append(f"{em} {a} · {n} ev · med {med:.1f}s · >2s: {over2:.0f}% · miss: {t_o}")
-                else:
-                    lines.append(f"{em} {a} · {n} ev · none caught up (>{LAG_MAX_WAIT:.0f}s)")
-            tg(
-                "📊 <b>LAG REPORT · last hour</b>\n"
-                "<i>Binance → Polymarket feed</i>\n\n"
-                + "\n".join(lines)
-                + f"\n\n⏱ {total} events total\n🕐 {est_str()}"
-            )
-        except Exception as e:
-            log.error(f"Lag report error: {e}")
-
-
-def start_lag_measurement():
-    if not LAG_MEASURE:
-        log.info("[LAG] disabled (LAG_MEASURE=false)")
-        return False
-    if not WEBSOCKET_AVAILABLE:
-        log.warning("[LAG] websocket-client missing - lag measurement disabled")
-        return False
-    threading.Thread(target=binance_ws_worker, daemon=True).start()
-    threading.Thread(target=lag_report_worker, daemon=True).start()
-    log.info("[LAG] Binance lag measurement started (hourly Telegram reports)")
-    return True
-
-
 # ─── WINDOW LOGIC ────────────────────────────────────────────────────────────
 def get_window_times(tf):
     now = datetime.now(timezone.utc)
@@ -1788,9 +1618,6 @@ def main():
     # Start stop loss monitoring thread
     start_stop_loss_thread()
 
-    # Start Binance lag measurement (measure-only; hourly Telegram reports)
-    lag_ok = start_lag_measurement()
-
     mode_str = "🚨 SIGNALS-ONLY" if SIGNALS_ONLY_MODE else "🤖 AUTO-TRADING"
 
     tg(
@@ -1805,7 +1632,6 @@ def main():
         f"🛑 Stop loss: {CONFIG['stop_loss_cents']:.0f}¢\n"
         f"⏸ Auto-pause after: {CONFIG['consecutive_loss_limit']} losses\n"
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n"
-        f"⚡ Lag measure: {'✅ hourly reports' if lag_ok else '❌ off'}\n"
         f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
