@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-# PAPER LONGSHOT — buys 1-5c deep-underdog side early in each window (no money)
-# Supports 5m, 15m, and 1h (60) timeframes. 5m/15m use timestamp slugs; hourly
-# uses the date-based slug (bitcoin-up-or-down-july-12-2026-8pm-et). A startup
-# probe confirms hourly markets resolve before trusting them.
+# LIVE LONGSHOT — buys 1-5c deep-underdog side early in each window (REAL money)
+# Ladder: sells LADDER_SELL_FRAC of remaining REAL shares each time the bid
+# doubles from the last rung. Remainder rides to settlement.
+#
+# FIX (2026-08-24): sells were computed off a CALCULATED share estimate
+# (stake / ask), not the shares actually received from the buy fill. A market
+# buy can fill for slightly fewer shares than the math predicts, so the ladder
+# was trying to sell MORE than was actually held -> repeated 400 "not enough
+# balance" errors, same rung retried forever, only one rung ever completing.
+# Fix: shares_total is now set from the buy response when available, and every
+# sell is capped at a tracked real balance, decremented only on confirmed fill.
 import os, time, json, sqlite3, logging, threading, requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -19,6 +26,10 @@ POLY_FUNDER      = os.environ.get("POLY_FUNDER", "")
 LIVE_STAKE       = float(os.environ.get("LIVE_STAKE", "5"))
 BANKROLL_STOP    = float(os.environ.get("BANKROLL_STOP", "30"))
 MAX_OPEN         = int(os.environ.get("MAX_OPEN", "7"))
+# Safety margin on every ladder sell: sell slightly LESS than the tracked
+# balance so small rounding differences from the exchange never cause a
+# "not enough balance" 400 again. 1.0 = no margin; 0.98 = sell 2% less.
+SELL_SAFETY_FRAC = float(os.environ.get("SELL_SAFETY_FRAC", "0.98"))
 _clob = None
 _live_realized = 0.0
 try:
@@ -47,20 +58,45 @@ def _clob_init():
         return False
 
 
-def live_buy(token_id, usdc):
-    """FAK market buy for $usdc. True only if filled."""
+def live_buy(token_id, usdc, est_shares=None):
+    """FAK market buy for $usdc. Returns (filled: bool, real_shares: float|None).
+    real_shares comes from the fill response so the ladder tracks what was
+    ACTUALLY bought, not a price-implied estimate. takingAmount is tried first
+    (on a BUY, "taking" is what you receive = shares). Whatever parses is
+    sanity-banded against the estimate: a value far outside 30%-120% of the
+    estimate is almost certainly a mis-parsed field (e.g. dollars, not shares)
+    and is DISCARDED rather than trusted — falling back to the estimate is
+    safer than silently tracking 5 "shares" when 100 were bought."""
     if not _clob:
-        return False
+        return False, None
     try:
         a = MarketOrderArgs(token_id=token_id, amount=usdc, side=BUY,
                             order_type=OrderType.FAK)
         r = _clob.create_and_post_market_order(order_args=a,
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
             order_type=OrderType.FAK)
-        return isinstance(r, dict) and (r.get("success") or r.get("status") == "matched")
+        ok = isinstance(r, dict) and (r.get("success") or r.get("status") == "matched")
+        real_shares = None
+        if ok and isinstance(r, dict):
+            for k in ("takingAmount", "filledSize", "size", "matchedAmount",
+                      "makingAmount"):
+                if r.get(k):
+                    try:
+                        val = float(r[k])
+                    except (TypeError, ValueError):
+                        continue
+                    if val > 1_000_000:      # raw base units -> shares
+                        val = val / 1_000_000
+                    if est_shares and not (0.3 * est_shares <= val <= 1.2 * est_shares):
+                        log.warning(f"[BUY] field {k}={val:.2f} implausible vs "
+                                    f"estimate {est_shares:.2f} — ignoring")
+                        continue
+                    real_shares = val
+                    break
+        return ok, real_shares
     except Exception as e:
         log.error(f"[BUY] {e}")
-        return False
+        return False, None
 
 
 def live_sell_market(token_id, shares):
@@ -90,23 +126,22 @@ SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
 SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "1800"))
 MAX_STACK           = int(os.environ.get("MAX_STACK", "1"))
-# Timeframes: 5, 15, 60 (60 = hourly). 30 is NOT a real Polymarket timeframe.
 TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15,60").split(",")]
-# Entry windows per timeframe (seconds from window open).
-ENTRY_FIRST_SECS     = float(os.environ.get("ENTRY_FIRST_SECS", "60"))       # 5m: 1 min
-ENTRY_FIRST_SECS_15M = float(os.environ.get("ENTRY_FIRST_SECS_15M", "180"))  # 15m: 3 min
-ENTRY_FIRST_SECS_60M = float(os.environ.get("ENTRY_FIRST_SECS_60M", "900"))  # 1h: 15 min
-ENTRY_FIRST_SECS_240M = float(os.environ.get("ENTRY_FIRST_SECS_240M", "3600"))  # 4h: first hour
+ENTRY_FIRST_SECS     = float(os.environ.get("ENTRY_FIRST_SECS", "60"))
+ENTRY_FIRST_SECS_15M = float(os.environ.get("ENTRY_FIRST_SECS_15M", "180"))
+ENTRY_FIRST_SECS_60M = float(os.environ.get("ENTRY_FIRST_SECS_60M", "900"))
+ENTRY_FIRST_SECS_240M = float(os.environ.get("ENTRY_FIRST_SECS_240M", "3600"))
 OPEN_CAPTURE_GRACE   = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
 
-# ── LADDER: sell half each time the bid doubles from the last rung ───────────
-# Only applies to slower timeframes (ladder needs time to play out).
 LADDER_ENABLED   = os.environ.get("LADDER_ENABLED", "true").lower() == "true"
-LADDER_MULT      = float(os.environ.get("LADDER_MULT", "2.0"))   # 2x each rung
-LADDER_SELL_FRAC = float(os.environ.get("LADDER_SELL_FRAC", "0.5"))  # sell half
+LADDER_MULT      = float(os.environ.get("LADDER_MULT", "2.0"))
+LADDER_SELL_FRAC = float(os.environ.get("LADDER_SELL_FRAC", "0.5"))
 LADDER_TFS       = set(int(x) for x in
                        os.environ.get("LADDER_TFS", "15,60,240").split(","))
 LADDER_POLL_SECS = float(os.environ.get("LADDER_POLL_SECS", "3"))
+# Minimum share sweep: Polymarket's practical minimum order size. If a rung's
+# half-slice would be smaller than this, sell everything remaining instead.
+MIN_SELL_SHARES = float(os.environ.get("MIN_SELL_SHARES", "5"))
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
@@ -124,7 +159,7 @@ BINANCE_SYM_TO_ASSET = {f"{s.upper()}USDT": s.upper()
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("paper-longshot")
+log = logging.getLogger("live-longshot")
 
 prices_ref = {}
 ref_last = {}
@@ -159,7 +194,6 @@ def binance_ref_worker():
 
 
 def window_times(tf):
-    """For 5/15: timestamp-aligned. For 60 (hourly): aligned to top of ET hour."""
     now = time.time()
     if tf == 60:
         now_et = datetime.now(timezone.utc).astimezone(ET)
@@ -168,7 +202,7 @@ def window_times(tf):
         return o, o + 3600, o + 3600 - now
     if tf == 240:
         now_et = datetime.now(timezone.utc).astimezone(ET)
-        block_hour = (now_et.hour // 4) * 4   # 0,4,8,12,16,20
+        block_hour = (now_et.hour // 4) * 4
         start_et = now_et.replace(hour=block_hour, minute=0, second=0, microsecond=0)
         o = int(start_et.timestamp())
         return o, o + 14400, o + 14400 - now
@@ -226,7 +260,6 @@ def best_ask_cents(token_id):
 
 
 def best_bid_cents(token_id):
-    """Best bid in cents — what a seller would receive right now."""
     try:
         r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
         b = r.json()
@@ -283,8 +316,12 @@ def init_db():
         direction TEXT, open_ts INTEGER, close_ts INTEGER, secs_left REAL,
         move_pct REAL, ask_cents REAL, open_price REAL, settle_price REAL,
         result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0, ladder_proceeds REAL DEFAULT 0,
-        hold_pnl REAL)""")
+        hold_pnl REAL, real_shares REAL)""")
     conn.execute("UPDATE paper SET result='VOID' WHERE result='PENDING'")
+    try:
+        conn.execute("ALTER TABLE paper ADD COLUMN real_shares REAL")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -301,6 +338,16 @@ def db_insert(asset, tf, direction, open_ts, close_ts, secs_left, move, ask, op)
     conn.commit()
     conn.close()
     return rid
+
+
+def db_set_real_shares(rid, val):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE paper SET real_shares=? WHERE id=?", (val, rid))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def db_resolve(rid, settle_price, result, pnl):
@@ -322,9 +369,11 @@ def db_resolve2(rid, settle_price, result, pnl, ladder_sold, ladder_proceeds, ho
 
 
 def ladder_monitor():
-    """Watches each open position's bid; each time it reaches the next rung
-    (2x the previous), sells LADDER_SELL_FRAC of remaining shares. Paper only —
-    records proceeds. Runs for LADDER_TFS timeframes."""
+    """Watches each open position's bid; each time it reaches the next rung,
+    sells LADDER_SELL_FRAC of remaining REAL shares (never the calculated
+    estimate). In LIVE mode a rung only advances on a CONFIRMED fill, and the
+    sell amount is capped by SELL_SAFETY_FRAC against the tracked balance so a
+    tiny exchange-side rounding difference can't trigger a 400 again."""
     if not LADDER_ENABLED:
         return
     while True:
@@ -343,34 +392,62 @@ def ladder_monitor():
                 bid = best_bid_cents(s["token"])
                 if bid is None:
                     continue
-                # climb rungs: may cross several at once on a fast move
                 sold_any = False
                 while bid >= s["next_rung"] and s["shares_left"] >= 1:
                     sell_shares = s["shares_left"] * LADDER_SELL_FRAC
-                    # Polymarket min order ~5 shares: if the half-slice is
-                    # smaller, sweep ALL remaining at this rung instead.
-                    if sell_shares < 5:
+                    if sell_shares < MIN_SELL_SHARES:
                         sell_shares = s["shares_left"]
                     if LIVE:
-                        if not live_sell_market(s["token"], round(sell_shares, 2)):
+                        # never try to sell more than the tracked real balance,
+                        # and shave a safety margin off to survive rounding
+                        safe_amt = round(min(sell_shares, s["shares_left"])
+                                         * SELL_SAFETY_FRAC, 2)
+                        if safe_amt < 1:
+                            break
+                        if not live_sell_market(s["token"], safe_amt):
                             log.info(f"[LADDER] live sell not filled "
-                                     f"{s['asset']} @{bid:.0f}¢ — retry next poll")
+                                     f"{s['asset']} @{bid:.0f}¢ amt={safe_amt} "
+                                     f"(tracked left={s['shares_left']:.2f}) "
+                                     f"— retry next poll")
                             break  # do NOT advance the rung; retry while bid holds
+                        sell_shares = safe_amt
                     proceeds = sell_shares * (bid / 100.0)
                     s["ladder_proceeds"] += proceeds
                     s["ladder_sold"] += sell_shares
                     s["shares_left"] -= sell_shares
                     s["next_rung"] *= LADDER_MULT
                     sold_any = True
-                if sold_any:
                     label = "4h" if s["tf"] == 240 else "1h" if s["tf"] == 60 else f"{s['tf']}m"
-                    tg(f"🪜 <b>LADDER SELL {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                       f"{label}</b> bid {bid:.0f}¢ · sold to {s['ladder_sold']:.0f} sh "
-                       f"(${s['ladder_proceeds']:.2f} banked) · {s['shares_left']:.0f} left "
-                       f"· next rung {s['next_rung']:.0f}¢")
-                    log.info(f"[LADDER] {s['asset']} {s['tf']} bid {bid:.0f}¢ "
-                             f"sold_total {s['ladder_sold']:.1f} proceeds "
-                             f"${s['ladder_proceeds']:.2f} left {s['shares_left']:.1f}")
+                    tg(f"🪜 <b>{ASSET_EMOJI.get(s['asset'],'')}{s['asset']} {label}</b>"
+                       f" — sold {sell_shares:.0f} sh @ {bid:.0f}¢ → +${proceeds:.2f}\n"
+                       f"banked ${s['ladder_proceeds']:.2f} · "
+                       f"{s['shares_left']:.0f} riding · next rung {s['next_rung']:.0f}¢")
+                    log.info(f"[LADDER] {s['asset']} {s['tf']} sold {sell_shares:.1f} "
+                             f"@ {bid:.0f}¢ banked ${s['ladder_proceeds']:.2f} "
+                             f"left {s['shares_left']:.1f}")
+                # minimum-share sweep: try to sell small remainders, but
+                # dust below the exchange minimum will REJECT — so cap at 3
+                # attempts, then let it ride to settlement (the scorer values
+                # riding shares correctly, so giving up costs nothing). Sub-1-
+                # share dust is written off immediately: never worth an order.
+                if s["shares_left"] > 0 and s["shares_left"] < MIN_SELL_SHARES and bid:
+                    if s["shares_left"] < 1:
+                        s["shares_left"] = 0.0   # write off pennies of dust
+                        continue
+                    if s.get("sweep_tries", 0) >= 3:
+                        continue                 # stop trying; ride to settle
+                    s["sweep_tries"] = s.get("sweep_tries", 0) + 1
+                    amt = round(s["shares_left"] * (SELL_SAFETY_FRAC if LIVE else 1.0), 2)
+                    filled = live_sell_market(s["token"], amt) if LIVE else True
+                    if filled and amt > 0:
+                        proceeds = amt * (bid / 100.0)
+                        s["ladder_proceeds"] += proceeds
+                        s["ladder_sold"] += amt
+                        s["shares_left"] -= amt
+                        tg(f"🪜 <b>{ASSET_EMOJI.get(s['asset'],'')}{s['asset']}</b>"
+                           f" — swept {amt:.1f} sh (dust) @ {bid:.0f}¢ → +${proceeds:.2f}\n"
+                           f"banked ${s['ladder_proceeds']:.2f} · "
+                           f"{s['shares_left']:.0f} riding")
         except Exception as e:
             log.error(f"[LADDER] {e}")
 
@@ -393,6 +470,11 @@ def db_scoreboard():
         d["pnl"] += r[1] or 0
     return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl,
             "avg_ask": avg, "by_tf": by_tf}
+
+
+def money(x):
+    """+$62.50 / −$5.00 — sign before the dollar, always two decimals."""
+    return f"{'+' if x >= 0 else '−'}${abs(x):.2f}"
 
 
 def tg(msg):
@@ -428,19 +510,79 @@ def handle_commands():
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
             if t == "/stats":
-                s = db_scoreboard()
-                wr = f"{s['wr']:.1f}%" if s["wr"] is not None else "—"
-                tf_lines = []
-                for tf in sorted(s["by_tf"]):
-                    d = s["by_tf"][tf]
-                    label = "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
-                    twr = d["w"]/d["n"]*100 if d["n"] else 0
-                    tf_lines.append(f"  {label}: {d['w']}/{d['n']} ({twr:.0f}%) ${d['pnl']:+.2f}")
-                tg(f"🎰 <b>PAPER LONGSHOT scoreboard</b>\n"
-                   f"trades: {s['n']} · win rate: <b>{wr}</b>\n"
-                   f"avg ask: {s['avg_ask']:.1f}¢\n"
-                   + ("\n".join(tf_lines) if tf_lines else "") +
-                   f"\nP&L: <b>${s['pnl']:+.2f}</b> (${PAPER_STAKE:g}/trade)")
+                sb = db_scoreboard()
+                mode = "LIVE" if (LIVE and _clob) else "PAPER"
+                if sb["n"] == 0:
+                    tg(f"📊 <b>LONGSHOT · {mode}</b>\nno settled trades yet")
+                    continue
+                tf_bits = []
+                for tf in sorted(sb["by_tf"]):
+                    d = sb["by_tf"][tf]
+                    lbl = "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
+                    sign = "+" if d["pnl"] >= 0 else "−"
+                    tf_bits.append(f"{lbl} {sign}${abs(d['pnl']):.0f}")
+                tg(f"📊 <b>LONGSHOT · {mode}</b>\n"
+                   f"{sb['n']} trades · {sb['wr']:.1f}% win\n"
+                   f"{' · '.join(tf_bits)}\n"
+                   f"━━━━━━━━━━\n"
+                   f"P&L <b>{money(sb['pnl'])}</b>")
+            elif t == "/status":
+                mode = "LIVE" if (LIVE and _clob) else "PAPER"
+                with pending_lock:
+                    snap = [dict(asset=p["asset"], tf=p["tf"],
+                                 direction=p["direction"], ask=p["ask"],
+                                 banked=p.get("ladder_proceeds", 0.0),
+                                 left=p.get("shares_left", 0.0),
+                                 rung=p.get("next_rung", 0.0))
+                            for p in pending]
+                head = (f"📊 <b>LONGSHOT · {mode} status</b>\n"
+                        f"{len(snap)} open / max {MAX_OPEN}")
+                if LIVE:
+                    bleft = max(0.0, BANKROLL_STOP + _live_realized)
+                    head += (f" · bankroll left ${bleft:.2f}/${BANKROLL_STOP:g}\n"
+                             f"realized {money(_live_realized)}")
+                lines = []
+                for p in snap:
+                    lbl = "4h" if p["tf"] == 240 else "1h" if p["tf"] == 60 else f"{p['tf']}m"
+                    ar = "↑" if p["direction"] == "UP" else "↓"
+                    st = (f"banked ${p['banked']:.2f}" if p["banked"] > 0
+                          else "no rungs yet")
+                    lines.append(f"{ASSET_EMOJI.get(p['asset'],'')}{p['asset']} "
+                                 f"{lbl} {ar} @{p['ask']:.0f}¢\n"
+                                 f"  {st} · {p['left']:.0f} riding · "
+                                 f"next {p['rung']:.0f}¢")
+                tg(head + ("\n\n" + "\n".join(lines) if lines else
+                           "\n\nno open positions"))
+            elif t == "/balance":
+                if not (LIVE and _clob):
+                    tg("📄 paper mode — no real balance")
+                    continue
+                bal = None
+                try:
+                    from py_clob_client_v2.clob_types import (
+                        BalanceAllowanceParams, AssetType)
+                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                    bal = _clob.get_balance_allowance(params=params)
+                except Exception as e1:
+                    try:
+                        bal = _clob.get_balance_allowance(
+                            params={"asset_type": "COLLATERAL"})
+                    except Exception as e2:
+                        tg(f"⚠️ balance fetch failed: {e1}")
+                        continue
+                try:
+                    raw = (float(bal.get("balance", 0))
+                           if isinstance(bal, dict) else float(bal))
+                    usdc = raw / 1_000_000 if raw > 1000 else raw
+                    tg(f"💰 <b>${usdc:.2f} USDC</b>")
+                except Exception:
+                    tg(f"💰 balance (raw): {bal}")
+            elif t == "/help":
+                tg("📖 <b>commands</b>\n"
+                   "/stats — scoreboard\n"
+                   "/status — open positions\n"
+                   "/balance — wallet USDC\n"
+                   "/help — this list")
     except Exception:
         pass
 
@@ -453,7 +595,6 @@ fired_last = {}
 
 
 def probe():
-    """Confirm hourly markets resolve (only if 60 is in TFS)."""
     if 60 not in TFS:
         return
     open_ts, close_ts, secs_left = window_times(60)
@@ -486,7 +627,6 @@ def engine():
                     wkey = (asset, tf, open_ts)
                     if wkey not in open_windows:
                         elapsed = (tf * 60) - secs_left
-                        # For hourly, capture whenever first seen (grace is generous)
                         if elapsed <= OPEN_CAPTURE_GRACE or tf in (60, 240):
                             open_windows[wkey] = ref
                         else:
@@ -515,25 +655,39 @@ def engine():
                         continue
                     direction, ask = min(cand, key=lambda x: x[1])
                     stake = LIVE_STAKE if LIVE else PAPER_STAKE
+                    real_shares = None
                     if LIVE:
                         if _live_realized <= -BANKROLL_STOP:
-                            continue  # bankroll stop — no new entries
+                            continue
                         with pending_lock:
                             if len(pending) >= MAX_OPEN:
-                                continue  # too many concurrent positions
+                                continue
                         tok_buy = toks[0] if direction == "UP" else toks[1]
-                        if not live_buy(tok_buy, stake):
+                        filled, real_shares = live_buy(
+                            tok_buy, stake, est_shares=stake / (ask / 100.0))
+                        if not filled:
                             log.warning(f"[LIVE] longshot buy failed {asset} {tf}")
                             continue
-                        tg(f"🟢 <b>LIVE LONGSHOT BUY {ASSET_EMOJI.get(asset,'')}"
-                           f"{asset} {'4h' if tf==240 else '1h' if tf==60 else str(tf)+'m'} "
-                           f"{direction}</b> ~{ask:.1f}¢ · ${stake:g}")
+                        _lb = "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
+                        _ar = "↑" if direction == "UP" else "↓"
+                        _sh = real_shares if real_shares else stake / (ask / 100.0)
+                        _sht = (f"{_sh:.0f} sh confirmed" if real_shares
+                                else f"~{_sh:.0f} sh (est)")
+                        tg(f"🟢 <b>{ASSET_EMOJI.get(asset,'')}{asset} {_lb} {_ar}</b>"
+                           f" — ${stake:g} @ {ask:.0f}¢\n"
+                           f"{_sht} · win pays +${_sh - stake:.0f}")
                     fired_last[wkey] = time.time()
                     rid = db_insert(asset, tf, direction, open_ts, close_ts,
                                     secs_left, move, ask, op)
+                    if real_shares:
+                        db_set_real_shares(rid, round(real_shares, 4))
                     fired_count[wkey] = fired_count.get(wkey, 0) + 1
                     with pending_lock:
-                        shares_total = (LIVE_STAKE if LIVE else PAPER_STAKE) / (ask / 100.0)
+                        # FIX: prefer the REAL filled shares from the buy
+                        # response; fall back to the price-implied estimate
+                        # only if the exchange didn't report a fill size.
+                        shares_total = (real_shares if real_shares
+                                       else stake / (ask / 100.0))
                         pending.append({"rid": rid, "asset": asset, "tf": tf,
                                         "direction": direction, "open_ts": open_ts,
                                         "close_ts": close_ts, "open_price": op,
@@ -543,18 +697,17 @@ def engine():
                                         "shares_left": shares_total,
                                         "next_rung": ask * LADDER_MULT,
                                         "ladder_proceeds": 0.0,
-                                        "ladder_sold": 0.0})
-                    if SEND_EACH:
-                        arrow = "⬆️" if direction == "UP" else "⬇️"
-                        shares = PAPER_STAKE / (ask / 100.0)
+                                        "ladder_sold": 0.0,
+                                        "real_shares": real_shares})
+                    if SEND_EACH and not LIVE:
+                        arrow = "↑" if direction == "UP" else "↓"
+                        shares = stake / (ask / 100.0)
                         label = "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
-                        tg(f"🎰 <b>LONGSHOT {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{label} {direction}</b>\n"
-                           f"ask <b>{ask:.1f}¢</b> ({shares:.0f} sh) · "
-                           f"elapsed {elapsed:.0f}s ≤ {first_secs:.0f}s\n"
-                           f"win +${shares*1.0-PAPER_STAKE:.2f} / lose -${PAPER_STAKE:.2f}")
+                        tg(f"📄 <b>{ASSET_EMOJI.get(asset,'')}{asset} {label} {arrow}</b>"
+                           f" — ${stake:g} @ {ask:.0f}¢\n"
+                           f"~{shares:.0f} sh · win pays +${shares - stake:.0f}")
                     log.info(f"[LONGSHOT] {asset} {tf} {direction} ask {ask:.1f}¢ "
-                             f"elapsed {elapsed:.0f}s")
+                             f"elapsed {elapsed:.0f}s real_shares={real_shares}")
         except Exception as e:
             log.error(f"[ENGINE] {e}")
 
@@ -587,18 +740,13 @@ def scorer():
                     outcome = "UP" if settle_px > op else "DOWN"
                     graded_by = "feed-fallback"
                 won = (s["direction"] == outcome)
-                # HOLD-to-settlement P&L (the baseline we compare against)
                 stake0 = LIVE_STAKE if LIVE else PAPER_STAKE
                 shares_total = s.get("shares_total", stake0 / (s["ask"] / 100.0))
                 hold_pnl = (shares_total * 1.0 - stake0) if won else -stake0
-                # LADDER P&L: proceeds already banked from selling on the way up,
-                # PLUS the remaining shares settling (worth $1 each if won, else 0)
                 proceeds = s.get("ladder_proceeds", 0.0)
                 shares_left = s.get("shares_left", shares_total)
                 remaining_settle = (shares_left * 1.0) if won else 0.0
                 ladder_pnl = proceeds + remaining_settle - stake0
-                # if the ladder is on for this tf, ladder_pnl is the real result;
-                # otherwise it equals hold_pnl (no rungs sold)
                 pnl = round(ladder_pnl, 4)
                 result = "WIN" if won else "LOSS"
                 if LIVE:
@@ -609,19 +757,26 @@ def scorer():
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
-                emoji = "\u2705" if won else "\u274c"
-                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                tag = "" if graded_by == "settlement" else " \u26a0\ufe0f feed-graded"
+                tag = "" if graded_by == "settlement" else " ⚠️ feed-graded"
                 label = "4h" if s["tf"] == 240 else "1h" if s["tf"] == 60 else f"{s['tf']}m"
-                sold_note = ""
-                if s.get("ladder_sold", 0) > 0:
-                    sold_note = (f"\nladder sold {s['ladder_sold']:.0f} sh for "
-                                 f"${proceeds:.2f} · {shares_left:.0f} rode to settle "
-                                 f"· vs hold ${hold_pnl:+.2f}")
-                tg(f"{emoji} LONGSHOT {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                   f"{label} {s['direction']} <b>{result}</b> ${pnl:+.2f} "
-                   f"\u00b7 {s['ask']:.1f}\u00a2{tag}{sold_note}\n"
-                   f"\U0001f3b0 {sb['n']} trades \u00b7 {wr} win \u00b7 P&L ${sb['pnl']:+.2f}")
+                em = ASSET_EMOJI.get(s['asset'], '')
+                foot = f"━ {sb['n']} trades · {money(sb['pnl'])} total"
+                if won:
+                    detail = (f"${proceeds:.2f} banked + {shares_left:.0f} sh paid out"
+                              if proceeds > 0 else f"{shares_left:.0f} sh paid out")
+                    tg(f"✅ <b>{em}{s['asset']} {label} WIN {money(pnl)}</b>{tag}\n"
+                       f"{detail}\n{foot}")
+                elif pnl > 0:
+                    tg(f"💰 <b>{em}{s['asset']} {label}</b> — settled against us, "
+                       f"ladder banked it{tag}\n"
+                       f"net {money(pnl)} · (holding = {money(hold_pnl)})\n{foot}")
+                elif s.get("ladder_sold", 0) > 0:
+                    tg(f"❌ <b>{em}{s['asset']} {label}</b> — ladder softened it{tag}\n"
+                       f"banked ${proceeds:.2f} · net {money(pnl)} · "
+                       f"(holding = {money(hold_pnl)})\n{foot}")
+                else:
+                    tg(f"❌ <b>{em}{s['asset']} {label}</b> — no rungs hit · "
+                       f"{money(pnl)}{tag}\n{foot}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
 
@@ -632,23 +787,22 @@ def main():
         return
     init_db()
     threading.Thread(target=binance_ref_worker, daemon=True).start()
-    labels = ", ".join("1h" if t == 60 else f"{t}m" for t in TFS)
+    labels = ", ".join("4h" if t==240 else "1h" if t == 60 else f"{t}m" for t in TFS)
     live_ok = _clob_init() if LIVE else False
     if LIVE and not live_ok:
         tg("🔴 LIVE=true but CLOB client failed (keys/SDK). Running PAPER only.")
     if LIVE and live_ok:
-        tg(f"🟢 <b>LIVE LONGSHOT armed</b> — REAL money\n"
-           f"ladder: sell {LADDER_SELL_FRAC:.0%} each {LADDER_MULT:g}x rung · "
-           f"stake ${LIVE_STAKE:g} · bankroll stop ${BANKROLL_STOP:g} · "
-           f"max open {MAX_OPEN}\n"
-           f"tf={{'/'.join('4h' if t==240 else '1h' if t==60 else str(t)+'m' for t in TFS)}}"
-           f" · band {TAKER_MIN_ASK_CENTS:.0f}-{TAKER_MAX_ASK_CENTS:.0f}¢\n/stats")
+        tg(f"🟢 <b>LIVE LONGSHOT armed</b> — REAL money (share-tracking fix)\n"
+           f"ladder: sell {LADDER_SELL_FRAC:.0%} each {LADDER_MULT:g}x rung "
+           f"(safety {SELL_SAFETY_FRAC:.0%}) · stake ${LIVE_STAKE:g} · "
+           f"bankroll stop ${BANKROLL_STOP:g} · max open {MAX_OPEN}\n"
+           f"tf={labels} · band {TAKER_MIN_ASK_CENTS:.0f}-{TAKER_MAX_ASK_CENTS:.0f}¢\n/stats")
     else:
         tg(f"🎰 <b>PAPER LONGSHOT live</b> — no money\n"
-       f"buys 1-5¢ side · 5m: first {ENTRY_FIRST_SECS:.0f}s · "
-       f"15m: first {ENTRY_FIRST_SECS_15M:.0f}s · 1h: first {ENTRY_FIRST_SECS_60M:.0f}s · "
-       f"4h: first {ENTRY_FIRST_SECS_240M:.0f}s\n"
-       f"tf={labels} · stake ${PAPER_STAKE:g}\n/stats")
+           f"buys 1-5¢ side · 5m: first {ENTRY_FIRST_SECS:.0f}s · "
+           f"15m: first {ENTRY_FIRST_SECS_15M:.0f}s · 1h: first {ENTRY_FIRST_SECS_60M:.0f}s · "
+           f"4h: first {ENTRY_FIRST_SECS_240M:.0f}s\n"
+           f"tf={labels} · stake ${PAPER_STAKE:g}\n/stats")
     time.sleep(3)
     probe()
     threading.Thread(target=engine, daemon=True).start()
