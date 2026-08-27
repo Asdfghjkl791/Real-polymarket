@@ -392,6 +392,8 @@ def ladder_monitor():
                 bid = best_bid_cents(s["token"])
                 if bid is None:
                     continue
+                if bid > s.get("peak_bid", 0.0):
+                    s["peak_bid"] = bid
                 sold_any = False
                 while bid >= s["next_rung"] and s["shares_left"] >= 1:
                     sell_shares = s["shares_left"] * LADDER_SELL_FRAC
@@ -533,7 +535,8 @@ def handle_commands():
                                  direction=p["direction"], ask=p["ask"],
                                  banked=p.get("ladder_proceeds", 0.0),
                                  left=p.get("shares_left", 0.0),
-                                 rung=p.get("next_rung", 0.0))
+                                 rung=p.get("next_rung", 0.0),
+                                 peak=p.get("peak_bid", 0.0))
                             for p in pending]
                 head = (f"📊 <b>LONGSHOT · {mode} status</b>\n"
                         f"{len(snap)} open / max {MAX_OPEN}")
@@ -547,10 +550,11 @@ def handle_commands():
                     ar = "↑" if p["direction"] == "UP" else "↓"
                     st = (f"banked ${p['banked']:.2f}" if p["banked"] > 0
                           else "no rungs yet")
+                    pk2 = f" · peak {p['peak']:.0f}¢" if p['peak'] else ""
                     lines.append(f"{ASSET_EMOJI.get(p['asset'],'')}{p['asset']} "
                                  f"{lbl} {ar} @{p['ask']:.0f}¢\n"
                                  f"  {st} · {p['left']:.0f} riding · "
-                                 f"next {p['rung']:.0f}¢")
+                                 f"next {p['rung']:.0f}¢{pk2}")
                 tg(head + ("\n\n" + "\n".join(lines) if lines else
                            "\n\nno open positions"))
             elif t == "/balance":
@@ -761,22 +765,27 @@ def scorer():
                 label = "4h" if s["tf"] == 240 else "1h" if s["tf"] == 60 else f"{s['tf']}m"
                 em = ASSET_EMOJI.get(s['asset'], '')
                 foot = f"━ {sb['n']} trades · {money(sb['pnl'])} total"
+                pk = s.get("peak_bid")
+                pk_seg = f" · peak {pk:.0f}¢" if pk else ""
                 if won:
                     detail = (f"${proceeds:.2f} banked + {shares_left:.0f} sh paid out"
                               if proceeds > 0 else f"{shares_left:.0f} sh paid out")
                     tg(f"✅ <b>{em}{s['asset']} {label} WIN {money(pnl)}</b>{tag}\n"
-                       f"{detail}\n{foot}")
+                       f"{detail}{pk_seg}\n{foot}")
                 elif pnl > 0:
                     tg(f"💰 <b>{em}{s['asset']} {label}</b> — settled against us, "
                        f"ladder banked it{tag}\n"
-                       f"net {money(pnl)} · (holding = {money(hold_pnl)})\n{foot}")
+                       f"net {money(pnl)} · (holding = {money(hold_pnl)}){pk_seg}\n{foot}")
                 elif s.get("ladder_sold", 0) > 0:
                     tg(f"❌ <b>{em}{s['asset']} {label}</b> — ladder softened it{tag}\n"
                        f"banked ${proceeds:.2f} · net {money(pnl)} · "
-                       f"(holding = {money(hold_pnl)})\n{foot}")
+                       f"(holding = {money(hold_pnl)}){pk_seg}\n{foot}")
                 else:
+                    need = s.get("next_rung", 0)
+                    why = (f"peak {pk:.0f}¢ · needed {need:.0f}¢\n"
+                           if pk and need else "")
                     tg(f"❌ <b>{em}{s['asset']} {label}</b> — no rungs hit · "
-                       f"{money(pnl)}{tag}\n{foot}")
+                       f"{money(pnl)}{tag}\n{why}{foot}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
 
