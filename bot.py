@@ -1080,6 +1080,11 @@ def _one_market(a, tf, o):
 def history_tf(tf, days):
     try:
         wins = _hist_windows(tf, days)
+        if tf == 5:   # 5m: weekday mornings only (8:30-11:30 ET) to keep it small
+            def _keep(o):
+                d = datetime.fromtimestamp(o, tz=ET)
+                return d.weekday() < 5 and 510 <= d.hour * 60 + d.minute < 690
+            wins = [o for o in wins if _keep(o)]
         jobs = [(a, tf, o) for o in wins for a in COINS]
         lab = label_for(tf)
         tg(f"⏳ /history {lab}: {len(jobs)} markets to fetch", force=True)
@@ -1229,14 +1234,14 @@ def run_command(t, args=()):
                f"3 files will arrive", force=True)
             threading.Thread(target=daily_history, args=(days,), daemon=True).start()
     elif t == "/history":
-        which = args[0] if args and args[0] in ("klines", "4h", "1h", "15m") else ""
+        which = args[0] if args and args[0] in ("klines", "4h", "1h", "15m", "5m") else ""
         nums = [a for a in args[1:] if a.replace(".", "").isdigit()]
         try:
             days = max(1, min(90, int(float(nums[0])))) if nums else 60
         except ValueError:
             days = 60
         if not which:
-            tg("use: /history 4h 60 · /history 1h 60 · /history 15m 30 · /history klines 60",
+            tg("use: /history 4h 60 · /history 1h 60 · /history 15m 30 · /history 5m 60 · /history klines 60",
                force=True)
         elif _hist2_running.is_set():
             tg("⏳ a /history run is already going — wait for its files", force=True)
@@ -1267,6 +1272,7 @@ def run_command(t, args=()):
            "/exportscans [days] — raw shadow scans (gz)\n/exportmkts — outcomes CSV\n"
            "/history1d [days] — past daily (24h) markets: prices + outcomes (default 60)\n"
            "/history 4h|1h|15m [days] — past markets for that timeframe\n"
+           "/history 5m [days] — past 5m markets, weekday mornings 8:30-11:30 ET only\n"
            "/history klines [days] — Binance 1m candles\n"
            "/mute · /unmute — hit messages off/on", force=True)
 
