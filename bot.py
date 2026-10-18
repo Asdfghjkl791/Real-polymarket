@@ -1012,6 +1012,132 @@ def daily_history(days):
         _hist_running.clear()
 
 
+# ── multi-timeframe history backfill (/history 4h|1h|15m|klines [days]) ──────
+_hist2_running = threading.Event()
+HIST_DIR = os.environ.get("HIST_DIR", os.path.dirname(os.path.abspath(DB_PATH)) or ".")
+
+
+def _hist_windows(tf, days):
+    """all window open times for tf over the last `days` full days (ET), oldest first"""
+    now = time.time()
+    end_o, _c, _l = window_times(tf, now)          # current (unfinished) window: skip it
+    start = now - days * 86400
+    out, o = [], end_o
+    while True:
+        prev, _c2, _l2 = window_times(tf, o - 1)
+        if prev < start:
+            break
+        out.append(prev)
+        o = prev
+    return out[::-1]
+
+
+def _one_market(a, tf, o):
+    c = window_times(tf, o + 1)[1]
+    ev = _get_json(f"{GAMMA_BASE}/events", {"slug": build_slug(a, tf, o)})
+    ev = ev[0] if isinstance(ev, list) and ev else ev
+    mk = ((ev or {}).get("markets") or []) if isinstance(ev, dict) else []
+    if not mk:
+        return None
+    m = mk[0]
+    try:
+        toks = json.loads(m.get("clobTokenIds") or "[]")
+        names = [x.lower() for x in json.loads(m.get("outcomes") or '["Up","Down"]')]
+        op = m.get("outcomePrices")
+        op = json.loads(op) if isinstance(op, str) else op
+    except Exception:
+        return None
+    if len(toks) != 2:
+        return None
+    iu = names.index("up") if "up" in names else 0
+    outcome = ""
+    try:
+        if float(op[iu]) >= 0.99:
+            outcome = "UP"
+        elif float(op[1 - iu]) >= 0.99:
+            outcome = "DOWN"
+    except Exception:
+        pass
+    res = {"mk": None, "px": []}
+    fids = []
+    for side, tok in (("UP", toks[iu]), ("DOWN", toks[1 - iu])):
+        got = []
+        for fid in (1, 5):
+            j = _get_json(f"{CLOB_BASE}/prices-history",
+                          dict(market=tok, startTs=o - 60, endTs=c + 60, fidelity=fid))
+            got = [(int(x["t"]), round(float(x["p"]) * 100, 3))
+                   for x in ((j or {}).get("history") or [])
+                   if "t" in x and "p" in x and o - 60 <= int(x["t"]) <= c + 60]
+            if got:
+                break
+        fids.append(fid if got else "")
+        res["px"] += [f"{a},{tf},{o},{side},{t},{px}" for t, px in got]
+    res["mk"] = (f"{a},{tf},{o},{c},{outcome},{m.get('volume', '')},"
+                 f"{fids[0]},{fids[1]}")
+    return res
+
+
+def history_tf(tf, days):
+    try:
+        wins = _hist_windows(tf, days)
+        jobs = [(a, tf, o) for o in wins for a in COINS]
+        lab = label_for(tf)
+        tg(f"⏳ /history {lab}: {len(jobs)} markets to fetch", force=True)
+        mpath = os.path.join(HIST_DIR, f"hist_{lab}_mkts.csv")
+        ppath = os.path.join(HIST_DIR, f"hist_{lab}_prices.csv.gz")
+        n_ok = n_px = 0
+        with open(mpath, "w") as fm, gzip.open(ppath, "wt") as fp:
+            fm.write("asset,tf,open_ts,close_ts,outcome,volume,fid_up,fid_dn\n")
+            fp.write("asset,tf,open_ts,side,t,price\n")
+            step = max(1, len(jobs) // 10)
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                for i, r in enumerate(ex.map(lambda j: _one_market(*j), jobs), 1):
+                    if r:
+                        fm.write(r["mk"] + "\n")
+                        if r["px"]:
+                            fp.write("\n".join(r["px"]) + "\n")
+                        n_ok += 1
+                        n_px += len(r["px"])
+                    if i % step == 0:
+                        tg(f"⏳ /history {lab}: {i}/{len(jobs)} · {n_ok} found", force=True)
+        with open(mpath, "rb") as f:
+            tg_document(os.path.basename(mpath), f.read(), f"{n_ok} {lab} markets · {days} days")
+        with open(ppath, "rb") as f:
+            tg_document(os.path.basename(ppath), f.read(), f"{n_px} price points",
+                        "application/gzip")
+    except Exception as e:
+        tg(f"⚠️ /history {tf} failed: {e}", force=True)
+    finally:
+        _hist2_running.clear()
+
+
+def history_klines(days):
+    try:
+        path = os.path.join(HIST_DIR, "hist_klines_1m.csv.gz")
+        end = int(time.time() // 60) * 60
+        start = end - days * 86400
+        n = 0
+        with gzip.open(path, "wt") as f:
+            f.write("asset,t,open,high,low,close,volume\n")
+            for a in COINS:
+                t = start
+                while t < end:
+                    k = _klines(f"{a}USDT", "1m", t * 1000, min(end, t + 60000) * 1000 - 1, 1000)
+                    if k:
+                        f.write("\n".join(f"{a},{int(x[0]) // 1000},{x[1]},{x[2]},{x[3]},{x[4]},{x[5]}"
+                                          for x in k) + "\n")
+                        n += len(k)
+                    t += 60000
+                    time.sleep(0.05)
+        with open(path, "rb") as f:
+            tg_document("hist_klines_1m.csv.gz", f.read(), f"{n} Binance 1m candles · {days} days",
+                        "application/gzip")
+    except Exception as e:
+        tg(f"⚠️ /history klines failed: {e}", force=True)
+    finally:
+        _hist2_running.clear()
+
+
 def handle_commands():
     global _upd, muted
     try:
@@ -1102,6 +1228,26 @@ def run_command(t, args=()):
             tg(f"⏳ pulling {days} days of daily (24h) markets — takes a few minutes, "
                f"3 files will arrive", force=True)
             threading.Thread(target=daily_history, args=(days,), daemon=True).start()
+    elif t == "/history":
+        which = args[0] if args and args[0] in ("klines", "4h", "1h", "15m") else ""
+        nums = [a for a in args[1:] if a.replace(".", "").isdigit()]
+        try:
+            days = max(1, min(90, int(float(nums[0])))) if nums else 60
+        except ValueError:
+            days = 60
+        if not which:
+            tg("use: /history 4h 60 · /history 1h 60 · /history 15m 30 · /history klines 60",
+               force=True)
+        elif _hist2_running.is_set():
+            tg("⏳ a /history run is already going — wait for its files", force=True)
+        else:
+            _hist2_running.set()
+            if which == "klines":
+                tg(f"⏳ pulling {days} days of Binance 1m candles…", force=True)
+                threading.Thread(target=history_klines, args=(days,), daemon=True).start()
+            else:
+                tfv = parse_tf(which)
+                threading.Thread(target=history_tf, args=(tfv, days), daemon=True).start()
     elif t == "/mute":
         muted = True
         tg("🔇 muted — still trading and recording. /unmute to turn messages back on",
@@ -1120,6 +1266,8 @@ def run_command(t, args=()):
            "/status — open positions\n/export — trades CSV\n"
            "/exportscans [days] — raw shadow scans (gz)\n/exportmkts — outcomes CSV\n"
            "/history1d [days] — past daily (24h) markets: prices + outcomes (default 60)\n"
+           "/history 4h|1h|15m [days] — past markets for that timeframe\n"
+           "/history klines [days] — Binance 1m candles\n"
            "/mute · /unmute — hit messages off/on", force=True)
 
 
