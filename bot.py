@@ -55,7 +55,7 @@
 
 import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 try:
     import websocket
@@ -83,6 +83,7 @@ ENTRY_SECS = {
     15:  float(os.environ.get("ENTRY_FIRST_SECS_15M", "180")),
     60:  float(os.environ.get("ENTRY_FIRST_SECS_60M", "900")),
     240: float(os.environ.get("ENTRY_FIRST_SECS_240M", "3600")),
+    1440: -1.0,  # daily: scan only, never paper-trades
 }
 LADDER_ENABLED   = env_bool("LADDER_ENABLED", "true")
 LADDER_MULT      = float(os.environ.get("LADDER_MULT", "2.0"))
@@ -94,6 +95,7 @@ SCAN_SECS = {
     15:  float(os.environ.get("SCAN_SECS_15M", "30")),
     60:  float(os.environ.get("SCAN_SECS_60M", "60")),
     240: float(os.environ.get("SCAN_SECS_240M", "180")),
+    1440: float(os.environ.get("SCAN_SECS_1D", "300")),
 }
 SCAN_VWAP_MAX_CENTS = float(os.environ.get("SCAN_VWAP_MAX_CENTS", "25"))
 SCAN_KEEP_DAYS = float(os.environ.get("SCAN_KEEP_DAYS", "30"))
@@ -101,7 +103,7 @@ SCAN_KEEP_DAYS = float(os.environ.get("SCAN_KEEP_DAYS", "30"))
 BANDS = [tuple(float(v) for v in b.split("-")) for b in
          os.environ.get("BANDS", "1-5,5-10,10-15,15-20").split(",") if "-" in b]
 # how often to look for entries / walk ladders, per timeframe
-POLL = {5: 2.0, 15: 3.0, 60: 8.0, 240: 15.0}
+POLL = {5: 2.0, 15: 3.0, 60: 8.0, 240: 15.0, 1440: 30.0}
 FEE_RATE = float(os.environ.get("FEE_RATE", "0.07"))
 SEND_EACH = env_bool("SEND_EACH", "false")
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
@@ -135,13 +137,13 @@ def money(x):
 
 
 def label_for(tf):
-    return "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
+    return "1d" if tf == 1440 else "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
 
 
 def parse_tf(arg):
     a = (arg or "").strip().lower()
     return {"5": 5, "5m": 5, "15": 15, "15m": 15, "60": 60, "1h": 60,
-            "240": 240, "4h": 240}.get(a)
+            "240": 240, "4h": 240, "1440": 1440, "1d": 1440, "24h": 1440}.get(a)
 
 
 def parse_args(args):
@@ -198,6 +200,15 @@ def binance_ref_worker():
 # ── market plumbing ─────────────────────────────────────────────────────────
 def window_times(tf, now=None):
     now = time.time() if now is None else now
+    if tf == 1440:
+        # daily market: noon ET -> next noon ET (Binance 1m close at noon)
+        now_et = datetime.fromtimestamp(now, tz=ET)
+        st = now_et.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now_et < st:
+            st = st - timedelta(days=1)
+        en = (st + timedelta(days=1)).replace(hour=12)
+        o, c = int(st.timestamp()), int(en.timestamp())
+        return o, c, c - now
     if tf == 60:
         now_et = datetime.fromtimestamp(now, tz=ET)
         o = int(now_et.replace(minute=0, second=0, microsecond=0).timestamp())
@@ -213,6 +224,10 @@ def window_times(tf, now=None):
 
 
 def build_slug(asset, tf, open_ts):
+    if tf == 1440:
+        d = datetime.fromtimestamp(open_ts, tz=ET) + timedelta(days=1)
+        return (f"{ASSET_FULLNAME[asset]}-up-or-down-on-{d.strftime('%B').lower()}-"
+                f"{d.day}-{d.year}")
     if tf == 240:
         return f"{asset.lower()}-updown-4h-{open_ts}"
     if tf == 60:
@@ -778,7 +793,7 @@ def do_scan(tf, open_ts, close_ts, secs_left):
                 vw, sh = round(fill[0], 4), round(fill[1], 4)
             depth = round(sum(s for p, s in bk["asks"] if p <= bk["ask"] + 1), 1)
         mv, _op, _px = move_pct(tf, open_ts, a)
-        rows.append((now, a, tf, open_ts, round(tf * 60 - secs_left, 1), ua, up["bid"],
+        rows.append((now, a, tf, open_ts, round(now - open_ts, 1), ua, up["bid"],
                      da, dn["bid"], cheap, bk["ask"], vw, sh, depth, mv))
         mark_due(a, tf, open_ts, close_ts)
     if rows:
@@ -794,7 +809,7 @@ def scanner():
             time.sleep(1.0)
             for tf in TFS:
                 open_ts, close_ts, secs_left = window_times(tf)
-                into = tf * 60 - secs_left
+                into = time.time() - open_ts
                 b = int(into // SCAN_SECS[tf])
                 key = (tf, open_ts, b)
                 if key in scan_done or secs_left < 2:
@@ -803,7 +818,7 @@ def scanner():
                 do_scan(tf, open_ts, close_ts, secs_left)
             if time.time() - last_prune > 3600:
                 last_prune = time.time()
-                old = time.time() - 6 * 3600
+                old = time.time() - 26 * 3600
                 scan_done.difference_update([k for k in scan_done if k[1] < old])
                 for k in [k for k in _market_cache if k[2] < old]:
                     _market_cache.pop(k, None)
@@ -863,9 +878,9 @@ def trader():
                 open_ts, close_ts, secs_left = window_times(tf, now)
                 if (tf, open_ts) not in open_ref:
                     # only trust the reference if we saw the window open
-                    fresh = tf * 60 - secs_left <= 5
+                    fresh = now - open_ts <= 5
                     open_ref[(tf, open_ts)] = dict(prices_ref) if fresh else {}
-                    old = now - 8 * 3600
+                    old = now - 26 * 3600
                     for k in [k for k in open_ref if k[1] < old]:
                         open_ref.pop(k, None)
                     for k in [k for k in fired if k[2] < old]:
