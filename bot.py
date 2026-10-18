@@ -898,6 +898,120 @@ def trader():
 _upd = None
 
 
+# ── daily-market history backfill (/history1d) ──────────────────────────────
+BINANCE_REST = os.environ.get("BINANCE_REST", "https://data-api.binance.vision/api/v3/klines")
+_hist_running = threading.Event()
+
+
+def _get_json(url, params, tries=3):
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(2 + 2 * i)
+                continue
+            return None
+        except Exception:
+            time.sleep(1 + i)
+    return None
+
+
+def _price_history(token, o, c):
+    """-> (fidelity_used, [(t, price_cents)]) for one outcome token"""
+    tries = [dict(startTs=o - 3600, endTs=c + 120, fidelity=5),
+             dict(startTs=o - 3600, endTs=c + 120, fidelity=60),
+             dict(interval="max", fidelity=60),
+             dict(interval="max", fidelity=720)]
+    for q in tries:
+        j = _get_json(f"{CLOB_BASE}/prices-history", dict(market=token, **q))
+        h = (j or {}).get("history") or []
+        h = [(int(x["t"]), round(float(x["p"]) * 100, 3)) for x in h
+             if "t" in x and "p" in x and o - 3600 <= int(x["t"]) <= c + 120]
+        if h:
+            return q["fidelity"], h
+        time.sleep(0.1)
+    return None, []
+
+
+def _klines(sym, interval, start_ms, end_ms, limit=1000):
+    j = _get_json(BINANCE_REST, dict(symbol=sym, interval=interval, startTime=start_ms,
+                                     endTime=end_ms, limit=limit))
+    return j if isinstance(j, list) else []
+
+
+def daily_history(days):
+    try:
+        mrows = ["asset,day,open_ts,close_ts,outcome,up_token,dn_token,volume,"
+                 "start_open,start_close,end_open,end_close,fid_up,fid_dn,n_up,n_dn"]
+        prows = ["asset,day,side,t,price"]
+        krows = ["asset,day,t,open,high,low,close"]
+        today = datetime.now(ET).date()
+        found = 0
+        for back in range(1, days + 1):
+            d = today - timedelta(days=back)
+            en = datetime(d.year, d.month, d.day, 12, tzinfo=ET)
+            st = en - timedelta(days=1)
+            o, c = int(st.timestamp()), int(en.timestamp())
+            for a in COINS:
+                ev = _get_json(f"{GAMMA_BASE}/events", {"slug": build_slug(a, 1440, o)})
+                ev = ev[0] if isinstance(ev, list) and ev else ev
+                mk = (ev or {}).get("markets") or [] if isinstance(ev, dict) else []
+                if not mk:
+                    continue
+                m = mk[0]
+                try:
+                    toks = json.loads(m.get("clobTokenIds") or "[]")
+                    names = [x.lower() for x in json.loads(m.get("outcomes") or '["Up","Down"]')]
+                    op = m.get("outcomePrices")
+                    op = json.loads(op) if isinstance(op, str) else op
+                except Exception:
+                    continue
+                if len(toks) != 2:
+                    continue
+                iu = names.index("up") if "up" in names else 0
+                up_t, dn_t = toks[iu], toks[1 - iu]
+                outcome = ""
+                try:
+                    if float(op[iu]) >= 0.99:
+                        outcome = "UP"
+                    elif float(op[1 - iu]) >= 0.99:
+                        outcome = "DOWN"
+                except Exception:
+                    pass
+                fu, hu = _price_history(up_t, o, c)
+                fd, hd = _price_history(dn_t, o, c)
+                for side, h in (("UP", hu), ("DOWN", hd)):
+                    prows += [f"{a},{d},{side},{t},{px}" for t, px in h]
+                so = sc = eo = ec = ""
+                sym = f"{a}USDT"
+                k1 = _klines(sym, "1m", o * 1000, o * 1000 + 59000, 2)
+                k2 = _klines(sym, "1m", c * 1000, c * 1000 + 59000, 2)
+                if k1:
+                    so, sc = k1[0][1], k1[0][4]
+                if k2:
+                    eo, ec = k2[0][1], k2[0][4]
+                k5 = _klines(sym, "5m", o * 1000, c * 1000, 1000)
+                krows += [f"{a},{d},{int(k[0]) // 1000},{k[1]},{k[2]},{k[3]},{k[4]}" for k in k5]
+                mrows.append(f"{a},{d},{o},{c},{outcome},{up_t},{dn_t},"
+                             f"{m.get('volume', '')},{so},{sc},{eo},{ec},{fu or ''},{fd or ''},"
+                             f"{len(hu)},{len(hd)}")
+                found += 1
+                time.sleep(0.15)
+            if back % 10 == 0:
+                tg(f"⏳ daily history: {back}/{days} days · {found} markets so far", force=True)
+        tg_document("daily_mkts.csv", "\n".join(mrows), f"{found} daily markets · {days} days")
+        tg_document("daily_prices.csv.gz", gzip.compress("\n".join(prows).encode()),
+                    f"{len(prows) - 1} price points", "application/gzip")
+        tg_document("daily_klines.csv.gz", gzip.compress("\n".join(krows).encode()),
+                    f"{len(krows) - 1} Binance 5m candles", "application/gzip")
+    except Exception as e:
+        tg(f"⚠️ /history1d failed: {e}", force=True)
+    finally:
+        _hist_running.clear()
+
+
 def handle_commands():
     global _upd, muted
     try:
@@ -976,6 +1090,18 @@ def run_command(t, args=()):
             tg_document("longshot_mkts.csv", rows_to_csv(rows), f"{len(rows)} markets")
         else:
             tg("no settled markets yet", force=True)
+    elif t == "/history1d":
+        try:
+            days = max(1, min(365, int(float(arg)))) if arg else 60
+        except ValueError:
+            days = 60
+        if _hist_running.is_set():
+            tg("⏳ already running — wait for the files", force=True)
+        else:
+            _hist_running.set()
+            tg(f"⏳ pulling {days} days of daily (24h) markets — takes a few minutes, "
+               f"3 files will arrive", force=True)
+            threading.Thread(target=daily_history, args=(days,), daemon=True).start()
     elif t == "/mute":
         muted = True
         tg("🔇 muted — still trading and recording. /unmute to turn messages back on",
@@ -993,6 +1119,7 @@ def run_command(t, args=()):
            "add a band to timing/coins/hours: <code>/timing 15m 15-20</code>\n"
            "/status — open positions\n/export — trades CSV\n"
            "/exportscans [days] — raw shadow scans (gz)\n/exportmkts — outcomes CSV\n"
+           "/history1d [days] — past daily (24h) markets: prices + outcomes (default 60)\n"
            "/mute · /unmute — hit messages off/on", force=True)
 
 
