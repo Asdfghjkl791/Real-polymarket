@@ -302,6 +302,22 @@ def vwap_fill(asks, dollars):
     return spent / shares * 100.0, shares, spent, levels
 
 
+def full_vwap(asks, dollars):
+    """average price (cents) to spend `dollars` now, or None if the book can't fill 99% of it"""
+    f = vwap_fill(asks, dollars)
+    if not f or f[2] < dollars * 0.99:
+        return None
+    return round(f[0], 3)
+
+
+def depth_1c(asks):
+    """$ for sale within 1 cent of the best ask"""
+    if not asks:
+        return None
+    top = asks[0][0]
+    return round(sum(px / 100.0 * sz for px, sz in asks if px <= top + 1), 1)
+
+
 def sell_fill(bids, shares):
     """Walk the bid book to sell `shares` -> (proceeds_dollars, shares_sold, fee)"""
     left, proceeds, fee = shares, 0.0, 0.0
@@ -369,6 +385,12 @@ def init_db():
             open_ts INTEGER, secs_into REAL, up_ask REAL, up_bid REAL,
             dn_ask REAL, dn_bid REAL, cheap TEXT, cheap_ask REAL, cheap_vwap REAL,
             cheap_shares REAL, cheap_depth REAL, move_pct REAL)""")
+        for col in ("up_v100", "up_v500", "up_v1000", "dn_v100", "dn_v500", "dn_v1000",
+                    "up_d1", "dn_d1"):
+            try:
+                conn.execute(f"ALTER TABLE scans ADD COLUMN {col} REAL")
+            except Exception:
+                pass   # column already exists
         conn.execute("CREATE INDEX IF NOT EXISTS scans_mkt ON scans(asset, tf, open_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS scans_ts ON scans(ts)")
         conn.execute("""CREATE TABLE IF NOT EXISTS mkts (
@@ -793,13 +815,17 @@ def do_scan(tf, open_ts, close_ts, secs_left):
                 vw, sh = round(fill[0], 4), round(fill[1], 4)
             depth = round(sum(s for p, s in bk["asks"] if p <= bk["ask"] + 1), 1)
         mv, _op, _px = move_pct(tf, open_ts, a)
+        dep = [full_vwap(up["asks"], 100), full_vwap(up["asks"], 500), full_vwap(up["asks"], 1000),
+               full_vwap(dn["asks"], 100), full_vwap(dn["asks"], 500), full_vwap(dn["asks"], 1000),
+               depth_1c(up["asks"]), depth_1c(dn["asks"])]
         rows.append((now, a, tf, open_ts, round(now - open_ts, 1), ua, up["bid"],
-                     da, dn["bid"], cheap, bk["ask"], vw, sh, depth, mv))
+                     da, dn["bid"], cheap, bk["ask"], vw, sh, depth, mv, *dep))
         mark_due(a, tf, open_ts, close_ts)
     if rows:
         db_exec("""INSERT INTO scans (ts,asset,tf,open_ts,secs_into,up_ask,up_bid,dn_ask,
-                   dn_bid,cheap,cheap_ask,cheap_vwap,cheap_shares,cheap_depth,move_pct)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows, many=True)
+                   dn_bid,cheap,cheap_ask,cheap_vwap,cheap_shares,cheap_depth,move_pct,
+                   up_v100,up_v500,up_v1000,dn_v100,dn_v500,dn_v1000,up_d1,dn_d1)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows, many=True)
 
 
 def scanner():
@@ -1143,6 +1169,95 @@ def history_klines(days):
         _hist2_running.clear()
 
 
+# ── past TRADES (who bought how much at what price) — /tradehist ─────────────
+DATA_API = "https://data-api.polymarket.com"
+_trade_running = threading.Event()
+
+
+def _market_meta(a, tf, o):
+    ev = _get_json(f"{GAMMA_BASE}/events", {"slug": build_slug(a, tf, o)})
+    ev = ev[0] if isinstance(ev, list) and ev else ev
+    mk = ((ev or {}).get("markets") or []) if isinstance(ev, dict) else []
+    if not mk:
+        return None
+    m = mk[0]
+    try:
+        toks = json.loads(m.get("clobTokenIds") or "[]")
+        names = [x.lower() for x in json.loads(m.get("outcomes") or '["Up","Down"]')]
+    except Exception:
+        return None
+    if len(toks) != 2 or not m.get("conditionId"):
+        return None
+    iu = names.index("up") if "up" in names else 0
+    return m["conditionId"], {toks[iu]: "UP", toks[1 - iu]: "DOWN"}
+
+
+def _market_trades(cond, tokmap, o, c, max_rows=20000):
+    out, off = [], 0
+    while off < max_rows:
+        j = _get_json(f"{DATA_API}/trades", {"market": cond, "limit": 500, "offset": off,
+                                             "takerOnly": "false"})
+        if not isinstance(j, list) or not j:
+            break
+        for t in j:
+            try:
+                ts = int(t.get("timestamp", 0))
+                if ts < o - 3600 or ts > c + 120:
+                    continue
+                side = tokmap.get(str(t.get("asset")), t.get("outcome", ""))
+                out.append((ts, str(side).upper(), str(t.get("side", "")).upper(),
+                            round(float(t.get("price", 0)) * 100, 2), round(float(t.get("size", 0)), 2)))
+            except Exception:
+                continue
+        if len(j) < 500:
+            break
+        off += 500
+        time.sleep(0.05)
+    return out
+
+
+def trade_history(tf, days, coins, hours):
+    try:
+        wins = _hist_windows(tf, days)
+        if hours:
+            lo, hi = hours
+            wins = [o for o in wins if datetime.fromtimestamp(o, tz=ET).weekday() < 5 and
+                    lo <= datetime.fromtimestamp(o, tz=ET).hour * 60 + datetime.fromtimestamp(o, tz=ET).minute < hi]
+        jobs = [(a, o) for o in wins for a in coins]
+        lab = label_for(tf)
+        tg(f"⏳ /tradehist {lab}: {len(jobs)} markets ({', '.join(coins)})", force=True)
+        path = os.path.join(HIST_DIR, f"trades_{lab}.csv.gz")
+        n_m = n_t = 0
+        step = max(1, len(jobs) // 10)
+
+        def one(job):
+            a, o = job
+            meta = _market_meta(a, tf, o)
+            if not meta:
+                return a, o, []
+            c = window_times(tf, o + 1)[1]
+            return a, o, _market_trades(meta[0], meta[1], o, c)
+        with gzip.open(path, "wt") as f:
+            f.write("asset,tf,open_ts,t,outcome,side,price,size\n")
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                for i, (a, o, rows) in enumerate(ex.map(one, jobs), 1):
+                    if rows:
+                        n_m += 1
+                        n_t += len(rows)
+                        f.write("\n".join(f"{a},{tf},{o},{t},{oc},{sd},{px},{sz}"
+                                          for t, oc, sd, px, sz in rows) + "\n")
+                    if i % step == 0:
+                        tg(f"⏳ /tradehist {lab}: {i}/{len(jobs)} · {n_t} trades", force=True)
+        with open(path, "rb") as f:
+            data = f.read()
+        tg_document(os.path.basename(path), data, f"{n_t} trades in {n_m} {lab} markets · {days} days",
+                    "application/gzip")
+    except Exception as e:
+        tg(f"⚠️ /tradehist failed: {e}", force=True)
+    finally:
+        _trade_running.clear()
+
+
 def handle_commands():
     global _upd, muted
     try:
@@ -1253,6 +1368,24 @@ def run_command(t, args=()):
             else:
                 tfv = parse_tf(which)
                 threading.Thread(target=history_tf, args=(tfv, days), daemon=True).start()
+    elif t == "/tradehist":
+        presets = {"5m": (5, ["BTC", "ETH", "SOL", "XRP", "DOGE"], (540, 660)),    # weekday 9-11am
+                   "15m": (15, ["BTC", "ETH", "SOL", "XRP", "DOGE"], (540, 660)),
+                   "1h": (60, ["BTC", "ETH"], None),                               # all hours
+                   "1hall": (60, ["BTC", "ETH", "SOL", "XRP", "DOGE"], None)}
+        which = args[0] if args and args[0] in presets else ""
+        try:
+            days = max(1, min(60, int(float(args[1])))) if len(args) > 1 else 14
+        except ValueError:
+            days = 14
+        if not which:
+            tg("use: /tradehist 5m 14 · /tradehist 15m 14 · /tradehist 1h 14 · /tradehist 1hall 14", force=True)
+        elif _trade_running.is_set():
+            tg("⏳ a /tradehist run is already going — wait for its file", force=True)
+        else:
+            _trade_running.set()
+            tfv, coins, hrs = presets[which]
+            threading.Thread(target=trade_history, args=(tfv, days, coins, hrs), daemon=True).start()
     elif t == "/mute":
         muted = True
         tg("🔇 muted — still trading and recording. /unmute to turn messages back on",
@@ -1274,6 +1407,7 @@ def run_command(t, args=()):
            "/history 4h|1h|15m [days] — past markets for that timeframe\n"
            "/history 5m [days] — past 5m markets, weekday mornings 8:30-11:30 ET only\n"
            "/history klines [days] — Binance 1m candles\n"
+           "/tradehist 5m|15m|1h|1hall [days] — every past trade (price, size) — shows how much money can fit\n"
            "/mute · /unmute — hit messages off/on", force=True)
 
 
