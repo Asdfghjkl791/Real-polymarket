@@ -1444,7 +1444,26 @@ MM_ENABLED = env_bool("MM_ENABLED", "false")
 MM_ASSET = os.environ.get("MM_ASSET", "BTC").upper()
 MM_TFS = [int(x) for x in os.environ.get("MM_TFS", "5,15").split(",") if x.strip()]
 MM_SIZE = float(os.environ.get("MM_SIZE", "50"))                 # $ per side per window
-MM_HALF = [float(x) for x in os.environ.get("MM_HALF_SPREADS", "2,3,5,8").split(",") if x.strip()]
+# v2 (Oct 20): quote around the MARKET midpoint; Binance is only a danger signal (pull quotes).
+# variant ids: 100+h = mid-h with guard, 200+h = mid-h without guard
+MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202").split(",") if x.strip()]
+MM_GUARD_CENTS = float(os.environ.get("MM_GUARD_CENTS", "3"))      # model vs market disagreement
+MM_JUMP_BPS = float(os.environ.get("MM_JUMP_BPS", "4"))            # BTC move in last 3s that pulls quotes
+MM_MAX_SPREAD = float(os.environ.get("MM_MAX_SPREAD", "5"))        # don't quote wider books
+MM_PAUSE_SECS = float(os.environ.get("MM_PAUSE_SECS", "5"))
+
+
+def mm_label(v):
+    return f"mid−{v - 100:g}¢ +guard" if v < 200 else f"mid−{v - 200:g}¢ no guard"
+
+
+def mm_jumped(now):
+    """did BTC move more than MM_JUMP_BPS in the last ~3 seconds?"""
+    px = prices_ref.get(MM_ASSET)
+    old = [p for t, p in mm_btc if now - 4 <= t <= now - 2]
+    if not px or not old:
+        return False
+    return abs(px / old[0] - 1) * 1e4 >= MM_JUMP_BPS
 MM_LAT = float(os.environ.get("MM_LATENCY_SECS", "0.5"))          # cancel/replace delay
 MM_STOP_SECS = float(os.environ.get("MM_STOP_SECS", "45"))        # stop quoting near the end
 MM_START_SECS = float(os.environ.get("MM_START_SECS", "10"))      # wait after open
@@ -1622,6 +1641,18 @@ def mm_step(now=None):
             mm_tokmap[dn_t] = (tf, open_ts, "DOWN", up_t)
             fair = mm_fair_up(tf, open_ts, now)
             into = now - open_ts
+            bu, au = mm_best(up_t, "bids"), mm_best(up_t, "asks")
+            bd, ad = mm_best(dn_t, "bids"), mm_best(dn_t, "asks")
+            mids = {}
+            for side, b_, a_ in (("UP", bu, au), ("DOWN", bd, ad)):
+                if b_ is not None and a_ is not None and a_ - b_ <= MM_MAX_SPREAD:
+                    mids[side] = (b_ + a_) / 2.0
+            mid_up = mids.get("UP")
+            disagree = (fair is not None and mid_up is not None and abs(fair - mid_up) > MM_GUARD_CENTS)
+            jump = mm_jumped(now)
+            if jump or disagree:
+                mm_stats["pause_until"] = max(mm_stats.get("pause_until", 0), now + MM_PAUSE_SECS)
+            paused = now < mm_stats.get("pause_until", 0)
             for v in MM_HALF:
                 key = (v, tf, open_ts)
                 st = mm_state.get(key)
@@ -1629,8 +1660,10 @@ def mm_step(now=None):
                     if (tf, open_ts) not in open_ref or not open_ref[(tf, open_ts)].get(MM_ASSET):
                         continue   # we didn't see this window open: skip it
                     st = mm_state[key] = mm_new_state(v, tf, open_ts)
-                quoting = (fair is not None and into >= MM_START_SECS and left >= MM_STOP_SECS
-                           and MM_FAIR_MIN <= fair <= MM_FAIR_MAX)
+                guard = v < 200
+                h = v - 100 if guard else v - 200
+                quoting = (into >= MM_START_SECS and left >= MM_STOP_SECS and mid_up is not None
+                           and MM_FAIR_MIN <= mid_up <= MM_FAIR_MAX and not (guard and paused))
                 for side, tok in (("UP", up_t), ("DOWN", dn_t)):
                     q = st["quotes"][side]
                     # apply a pending cancel/replace once its latency has passed
@@ -1651,7 +1684,13 @@ def mm_step(now=None):
                         if q["px"] is not None and not (q["pending"] and q["pending"][0] is None):
                             q["pending"] = (None, now + MM_LAT)
                         continue
-                    want = (fair if side == "UP" else 100.0 - fair) - v
+                    if side not in mids:
+                        want = None
+                        cur = q["pending"][0] if q["pending"] else q["px"]
+                        if cur is not None:
+                            q["pending"] = (None, now + MM_LAT)
+                        continue
+                    want = mids[side] - h
                     best_ask = mm_best(tok, "asks")
                     if best_ask is not None:
                         want = min(want, best_ask - 1.0)      # post-only: never cross the ask
@@ -1831,13 +1870,14 @@ def mm_init_db():
 
 def mm_text(scope="today"):
     since = today_start() if scope == "today" else 0
-    rows = db_query("SELECT * FROM mm_mkts WHERE open_ts >= ? ORDER BY open_ts", (since,))
+    rows = db_query("SELECT * FROM mm_mkts WHERE open_ts >= ? AND variant >= 100 ORDER BY open_ts", (since,))
     lag = sorted(mm_stats["ws_lag"])
     lag_s = f"{lag[len(lag) // 2]:.2f}s" if lag else "n/a"
     lines = [f"🏦 <b>PAPER MARKET MAKER</b> · {MM_ASSET} {'/'.join(label_for(t) for t in MM_TFS)} · "
              f"${MM_SIZE:g}/side · latency {MM_LAT:g}s · {'today' if scope == 'today' else 'all time'}",
              f"feed: {mm_stats['ws_msgs']} ws msgs · {mm_stats['trades']} trades seen · median lag {lag_s} · "
-             f"rest polls {mm_stats['rest_polls']} · errors {mm_stats['errors']}"]
+             f"rest polls {mm_stats['rest_polls']} · errors {mm_stats['errors']} · v2: quotes around market mid, "
+             f"pulls on >{MM_GUARD_CENTS:g}¢ disagreement or >{MM_JUMP_BPS:g}bp BTC jump"]
     if not rows:
         lines.append("no settled markets yet")
         return "\n".join(lines)
@@ -1851,7 +1891,7 @@ def mm_text(scope="today"):
             reb = sum(r["rebate"] for r in rs)
             vol = sum(r["cost"] for r in rs)
             wins = sum(1 for r in rs if r["pnl"] > 0)
-            lines.append(f"±{v:g}¢ {label_for(tf)}: {len(rs)} mkts · both sides {both / len(rs) * 100:.0f}% · "
+            lines.append(f"{mm_label(v)} {label_for(tf)}: {len(rs)} mkts · both sides {both / len(rs) * 100:.0f}% · "
                          f"traded ${vol:.0f} · {money(pnl)} (rebates {money(reb)}) · {wins}/{len(rs)} mkts +")
     return "\n".join(lines)
 
@@ -1862,7 +1902,7 @@ def mm_start():
     mm_init_db()
     for fn in (mm_loop, mm_ws_worker, mm_rest_worker, mm_settle_worker):
         threading.Thread(target=fn, daemon=True).start()
-    log.info(f"[MM] paper market maker ON: {MM_ASSET} {MM_TFS} half-spreads {MM_HALF} size ${MM_SIZE}")
+    log.info(f"[MM] paper market maker v2 ON: {MM_ASSET} {MM_TFS} variants {MM_HALF} size ${MM_SIZE}")
 
 
 
