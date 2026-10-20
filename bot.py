@@ -1386,6 +1386,21 @@ def run_command(t, args=()):
             _trade_running.set()
             tfv, coins, hrs = presets[which]
             threading.Thread(target=trade_history, args=(tfv, days, coins, hrs), daemon=True).start()
+    elif t == "/mm":
+        if not MM_ENABLED:
+            tg("🏦 paper market maker is OFF — set MM_ENABLED=true in Railway to start it", force=True)
+        else:
+            tg(mm_text("all" if arg == "all" else "today"), force=True)
+    elif t == "/mmexport":
+        rows = db_query("SELECT * FROM mm_mkts ORDER BY open_ts") if MM_ENABLED else []
+        fills = db_query("SELECT * FROM mm_fills ORDER BY id") if MM_ENABLED else []
+        if rows:
+            tg_document("mm_markets.csv", rows_to_csv(rows), f"{len(rows)} settled paper-MM markets")
+        if fills:
+            tg_document("mm_fills.csv.gz", gzip.compress(rows_to_csv(fills).encode()),
+                        f"{len(fills)} paper-MM fills", "application/gzip")
+        if not rows and not fills:
+            tg("no paper-MM data yet", force=True)
     elif t == "/mute":
         muted = True
         tg("🔇 muted — still trading and recording. /unmute to turn messages back on",
@@ -1408,7 +1423,447 @@ def run_command(t, args=()):
            "/history 5m [days] — past 5m markets, weekday mornings 8:30-11:30 ET only\n"
            "/history klines [days] — Binance 1m candles\n"
            "/tradehist 5m|15m|1h|1hall [days] — every past trade (price, size) — shows how much money can fit\n"
+           "/mm · /mm all — paper market maker results · /mmexport — its fills + markets\n"
            "/mute · /unmute — hit messages off/on", force=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAPER MARKET MAKER — BTC up/down (5m + 15m). NO REAL ORDERS. Off unless MM_ENABLED=true.
+#   * fair value of UP from Binance BTC (prices_ref) vs window open, using short-term vol
+#   * pretend bids on UP and DOWN at fair - half_spread (several half-spreads at once = variants)
+#   * fills simulated against the REAL Polymarket feed (websocket book + trades):
+#       - a trade below our bid fills us; a trade AT our bid fills us only after the queue
+#         that was ahead of us is used up; a resting ask at/below our bid fills us (cross)
+#   * cancels/re-quotes take MM_LATENCY_SECS to happen — old quotes can still get hit meanwhile
+#   * each side can fill up to MM_SIZE dollars per window; held to settlement; rebates estimated
+# ════════════════════════════════════════════════════════════════════════════
+import math
+from collections import deque
+
+MM_ENABLED = env_bool("MM_ENABLED", "false")
+MM_ASSET = os.environ.get("MM_ASSET", "BTC").upper()
+MM_TFS = [int(x) for x in os.environ.get("MM_TFS", "5,15").split(",") if x.strip()]
+MM_SIZE = float(os.environ.get("MM_SIZE", "50"))                 # $ per side per window
+MM_HALF = [float(x) for x in os.environ.get("MM_HALF_SPREADS", "2,3,5,8").split(",") if x.strip()]
+MM_LAT = float(os.environ.get("MM_LATENCY_SECS", "0.5"))          # cancel/replace delay
+MM_STOP_SECS = float(os.environ.get("MM_STOP_SECS", "45"))        # stop quoting near the end
+MM_START_SECS = float(os.environ.get("MM_START_SECS", "10"))      # wait after open
+MM_FAIR_MIN, MM_FAIR_MAX = 8.0, 92.0                              # don't quote extreme markets
+MM_REQUOTE = float(os.environ.get("MM_REQUOTE_CENTS", "1"))
+MM_REBATE_SHARE = 0.20                                            # crypto maker rebate share
+MM_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+mm_lock = threading.RLock()
+mm_books = {}        # token -> {"bids": {px: sz}, "asks": {px: sz}, "ts": t}
+mm_tokmap = {}       # token -> (tf, open_ts, "UP"/"DOWN", other_token)
+mm_state = {}        # (variant, tf, open_ts) -> dict
+mm_btc = deque(maxlen=3600)     # (ts, price) ~1/s
+mm_stats = {"ws_msgs": 0, "ws_last": 0.0, "ws_lag": deque(maxlen=500), "trades": 0,
+            "rest_polls": 0, "started": time.time(), "errors": 0}
+mm_ws_holder = {"ws": None, "tokens": ()}
+_mm_seen = {}
+
+
+def mm_norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def mm_sigma():
+    """per-second vol of BTC from ~1s samples over the last 15 min (floored)"""
+    pts = [p for p in mm_btc if p[0] >= time.time() - 900]
+    if len(pts) < 60:
+        return 6e-5
+    r = []
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        dt = t1 - t0
+        if dt > 0 and p0 > 0 and p1 > 0:
+            r.append((math.log(p1 / p0)) ** 2 / dt)
+    if len(r) < 30:
+        return 6e-5
+    return max(2e-5, math.sqrt(sum(r) / len(r)))
+
+
+def mm_fair_up(tf, open_ts, now):
+    op = open_ref.get((tf, open_ts), {}).get(MM_ASSET)
+    px = prices_ref.get(MM_ASSET)
+    left = open_ts + tf * 60 - now
+    if not op or not px or left <= 0:
+        return None
+    z = math.log(px / op) / (mm_sigma() * math.sqrt(left))
+    return 100.0 * mm_norm_cdf(z)
+
+
+# ── book / trade handling ────────────────────────────────────────────────────
+def mm_book_set(token, bids, asks, ts=None):
+    with mm_lock:
+        mm_books[token] = {"bids": dict(bids), "asks": dict(asks), "ts": ts or time.time()}
+        mm_check_cross(token)
+
+
+def mm_book_change(token, side, px, sz):
+    with mm_lock:
+        b = mm_books.setdefault(token, {"bids": {}, "asks": {}, "ts": time.time()})
+        lvl = b["bids"] if side == "BUY" else b["asks"]
+        if sz <= 0:
+            lvl.pop(px, None)
+        else:
+            lvl[px] = sz
+        b["ts"] = time.time()
+        if side != "BUY":
+            mm_check_cross(token)
+
+
+def mm_best(token, kind):
+    b = mm_books.get(token)
+    if not b or not b[kind]:
+        return None
+    return max(b[kind]) if kind == "bids" else min(b[kind])
+
+
+def mm_on_trade(token, px, size, taker_side):
+    """a real trade happened. Work out whose BIDS it hit: a taker SELL on this token hits bids on
+    this token at px; a taker BUY on this token at px can match bids on the OTHER token at 100-px."""
+    with mm_lock:
+        mm_stats["trades"] += 1
+        info = mm_tokmap.get(token)
+        if not info:
+            return
+        tf, open_ts, side, other = info
+        now = time.time()
+        dk = (tf, open_ts, round(size, 2), round(px if side == "UP" else 100.0 - px, 2))
+        if now - _mm_seen.get(dk, 0) < 1.5:
+            return            # same match already seen on the other token
+        _mm_seen[dk] = now
+        if len(_mm_seen) > 20000:
+            _mm_seen.clear()
+        if taker_side == "SELL":
+            hit_side, hit_px = side, px
+        else:
+            hit_side, hit_px = ("DOWN" if side == "UP" else "UP"), round(100.0 - px, 3)
+        for (v, t2, o2), st in mm_state.items():
+            if (t2, o2) != (tf, open_ts):
+                continue
+            q = st["quotes"].get(hit_side)
+            if not q or q["px"] is None or time.time() < q["live_at"]:
+                continue
+            if hit_px < q["px"] - 1e-9:
+                mm_fill(st, hit_side, q, q["left_sh"], "through")
+            elif abs(hit_px - q["px"]) < 1e-9:
+                q["queue"] -= size
+                if q["queue"] < 0:
+                    mm_fill(st, hit_side, q, min(q["left_sh"], -q["queue"]), "queue")
+                    q["queue"] = 0.0
+
+
+def mm_check_cross(token):
+    """someone is now OFFERING at or below our bid on this token -> we'd have been filled"""
+    info = mm_tokmap.get(token)
+    if not info:
+        return
+    tf, open_ts, side, _o = info
+    ask = mm_best(token, "asks")
+    if ask is None:
+        return
+    for (v, t2, o2), st in mm_state.items():
+        if (t2, o2) != (tf, open_ts):
+            continue
+        q = st["quotes"].get(side)
+        if q and q["px"] is not None and time.time() >= q["live_at"] and ask <= q["px"] + 1e-9:
+            mm_fill(st, side, q, q["left_sh"], "cross")
+
+
+def mm_fill(st, side, q, shares, kind):
+    if shares <= 1e-9:
+        return
+    px = q["px"]
+    st["pos"][side] += shares
+    st["cost"] += shares * px / 100.0
+    st["rebate"] += MM_REBATE_SHARE * fee_for(shares, px / 100.0)
+    q["left_sh"] -= shares
+    now = time.time()
+    fair = mm_fair_up(st["tf"], st["open_ts"], now)
+    st["fills"].append((now, side, px, shares, kind))
+    try:
+        db_exec("INSERT INTO mm_fills (ts,variant,tf,open_ts,side,px,shares,kind,fair_up,btc,secs_left) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (now, st["variant"], st["tf"], st["open_ts"], side, px, round(shares, 3), kind,
+                 round(fair, 2) if fair is not None else None, prices_ref.get(MM_ASSET),
+                 round(st["open_ts"] + st["tf"] * 60 - now, 1)))
+    except Exception as e:
+        log.error(f"[MM] fill log: {e}")
+    if q["left_sh"] <= 1e-6:
+        q["px"] = None          # side done for this window
+        q["done"] = True
+
+
+# ── quoting loop ─────────────────────────────────────────────────────────────
+def mm_new_state(v, tf, open_ts):
+    return {"variant": v, "tf": tf, "open_ts": open_ts, "close_ts": open_ts + tf * 60,
+            "pos": {"UP": 0.0, "DOWN": 0.0}, "cost": 0.0, "rebate": 0.0, "fills": [],
+            "quotes": {s: {"px": None, "live_at": 0.0, "queue": 0.0, "left_sh": 0.0, "done": False,
+                           "pending": None} for s in ("UP", "DOWN")}, "settled": False}
+
+
+def mm_bid_size_at(token, px):
+    b = mm_books.get(token)
+    return float(b["bids"].get(px, 0.0)) if b else 0.0
+
+
+def mm_step(now=None):
+    now = time.time() if now is None else now
+    with mm_lock:
+        for tf in MM_TFS:
+            open_ts, close_ts, left = window_times(tf, now)
+            toks = resolve_tokens(MM_ASSET, tf, open_ts)
+            if not toks:
+                continue
+            up_t, dn_t = toks
+            mm_tokmap[up_t] = (tf, open_ts, "UP", dn_t)
+            mm_tokmap[dn_t] = (tf, open_ts, "DOWN", up_t)
+            fair = mm_fair_up(tf, open_ts, now)
+            into = now - open_ts
+            for v in MM_HALF:
+                key = (v, tf, open_ts)
+                st = mm_state.get(key)
+                if st is None:
+                    if (tf, open_ts) not in open_ref or not open_ref[(tf, open_ts)].get(MM_ASSET):
+                        continue   # we didn't see this window open: skip it
+                    st = mm_state[key] = mm_new_state(v, tf, open_ts)
+                quoting = (fair is not None and into >= MM_START_SECS and left >= MM_STOP_SECS
+                           and MM_FAIR_MIN <= fair <= MM_FAIR_MAX)
+                for side, tok in (("UP", up_t), ("DOWN", dn_t)):
+                    q = st["quotes"][side]
+                    # apply a pending cancel/replace once its latency has passed
+                    if q["pending"] and now >= q["pending"][1]:
+                        newpx = q["pending"][0]
+                        q["pending"] = None
+                        if newpx is None or q["done"]:
+                            q["px"] = None
+                        else:
+                            q["px"] = newpx
+                            q["live_at"] = now
+                            q["queue"] = mm_bid_size_at(tok, newpx)
+                            spent = sum(f[3] * f[2] / 100.0 for f in st["fills"] if f[1] == side)
+                            q["left_sh"] = max(0.0, (MM_SIZE - spent) / (newpx / 100.0))
+                    if q["done"]:
+                        continue
+                    if not quoting:
+                        if q["px"] is not None and not (q["pending"] and q["pending"][0] is None):
+                            q["pending"] = (None, now + MM_LAT)
+                        continue
+                    want = (fair if side == "UP" else 100.0 - fair) - v
+                    best_ask = mm_best(tok, "asks")
+                    if best_ask is not None:
+                        want = min(want, best_ask - 1.0)      # post-only: never cross the ask
+                    want = math.floor(want)
+                    if want < 1:
+                        want = None
+                    cur = q["pending"][0] if q["pending"] else q["px"]
+                    if want is None:
+                        if cur is not None:
+                            q["pending"] = (None, now + MM_LAT)
+                    elif cur is None or abs(want - cur) >= MM_REQUOTE:
+                        q["pending"] = (float(want), now + MM_LAT)
+
+
+def mm_loop():
+    last_sample = 0
+    while True:
+        try:
+            time.sleep(0.2)
+            now = time.time()
+            px = prices_ref.get(MM_ASSET)
+            if px and now - last_sample >= 1.0:
+                mm_btc.append((now, px))
+                last_sample = now
+            mm_step(now)
+        except Exception as e:
+            mm_stats["errors"] += 1
+            log.error(f"[MM] loop: {e}")
+            time.sleep(1)
+
+
+# ── feeds: Polymarket websocket (primary) + REST book polling (fallback) ─────
+def mm_handle_msg(raw):
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return
+    items = data if isinstance(data, list) else [data]
+    now = time.time()
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        mm_stats["ws_msgs"] += 1
+        mm_stats["ws_last"] = now
+        try:
+            ts = float(m.get("timestamp", 0)) / 1000.0
+            if ts > 1e9:
+                mm_stats["ws_lag"].append(now - ts)
+        except Exception:
+            pass
+        et = m.get("event_type")
+        if et == "book":
+            tok = str(m.get("asset_id"))
+            bids = {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])}
+            asks = {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}
+            mm_book_set(tok, bids, asks)
+        elif et == "price_change":
+            chg = m.get("price_changes") or m.get("changes") or []
+            for c in chg:
+                tok = str(c.get("asset_id") or m.get("asset_id"))
+                mm_book_change(tok, str(c.get("side", "")).upper(), round(float(c["price"]) * 100, 3),
+                               float(c.get("size", 0)))
+        elif et == "last_trade_price":
+            mm_on_trade(str(m.get("asset_id")), round(float(m["price"]) * 100, 3), float(m.get("size", 0)),
+                        str(m.get("side", "")).upper())
+
+
+def mm_ws_worker():
+    while True:
+        try:
+            with mm_lock:
+                toks = tuple(sorted(t for t, inf in mm_tokmap.items()
+                                    if inf[1] + inf[0] * 60 > time.time() - 5))
+            if not toks:
+                time.sleep(2)
+                continue
+            mm_ws_holder["tokens"] = toks
+
+            def on_open(ws):
+                ws.send(json.dumps({"assets_ids": list(toks), "type": "market"}))
+
+            def on_message(ws, msg):
+                mm_handle_msg(msg)
+                with mm_lock:
+                    cur = tuple(sorted(t for t, inf in mm_tokmap.items()
+                                       if inf[1] + inf[0] * 60 > time.time() - 5))
+                if cur != toks:          # new windows -> resubscribe
+                    ws.close()
+
+            ws = websocket.WebSocketApp(MM_WS_URL, on_open=on_open, on_message=on_message)
+            mm_ws_holder["ws"] = ws
+            ws.run_forever(ping_interval=15, ping_timeout=10)
+        except Exception as e:
+            mm_stats["errors"] += 1
+            log.warning(f"[MM] ws: {e}")
+        time.sleep(1)
+
+
+def mm_rest_worker():
+    """if the websocket goes quiet, keep books fresh from REST (no trade prints -> cross fills only)"""
+    while True:
+        try:
+            time.sleep(1.0)
+            if time.time() - mm_stats["ws_last"] < 5:
+                continue
+            with mm_lock:
+                toks = [t for t, inf in mm_tokmap.items() if inf[1] + inf[0] * 60 > time.time()]
+            for tok in toks:
+                b = get_book(tok)
+                if b:
+                    mm_stats["rest_polls"] += 1
+                    mm_book_set(tok, {p: s for p, s in b["bids"]}, {p: s for p, s in b["asks"]})
+        except Exception as e:
+            mm_stats["errors"] += 1
+            log.error(f"[MM] rest: {e}")
+
+
+# ── settlement & reporting ───────────────────────────────────────────────────
+_mm_outcomes = {}
+
+
+def mm_settle_once(now=None):
+    now = time.time() if now is None else now
+    with mm_lock:
+        due = [(k, st) for k, st in mm_state.items() if not st["settled"] and now >= st["close_ts"] + 20]
+    for k, st in due:
+        key = (st["tf"], st["open_ts"])
+        oc = _mm_outcomes.get(key)
+        if oc is None:
+            oc = fetch_outcome(MM_ASSET, st["tf"], st["open_ts"])
+            if oc is None:
+                if now > st["close_ts"] + 1800:
+                    oc = "VOID"
+                else:
+                    continue
+            _mm_outcomes[key] = oc
+        with mm_lock:
+            payout = st["pos"]["UP"] if oc == "UP" else st["pos"]["DOWN"] if oc == "DOWN" else st["cost"]
+            pnl = payout - st["cost"]
+            st["settled"] = True
+        if st["fills"]:
+            db_exec("INSERT OR REPLACE INTO mm_mkts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (st["variant"], st["tf"], st["open_ts"], oc, round(st["pos"]["UP"], 3),
+                     round(st["pos"]["DOWN"], 3), round(st["cost"], 4), round(payout, 4),
+                     round(st["rebate"], 4), round(pnl + st["rebate"], 4), len(st["fills"])))
+        with mm_lock:
+            mm_state.pop(k, None)
+    # forget old token mappings / books
+    with mm_lock:
+        for t in [t for t, inf in mm_tokmap.items() if inf[1] + inf[0] * 60 < now - 3600]:
+            mm_tokmap.pop(t, None)
+            mm_books.pop(t, None)
+
+
+def mm_settle_worker():
+    while True:
+        try:
+            time.sleep(10)
+            mm_settle_once()
+        except Exception as e:
+            mm_stats["errors"] += 1
+            log.error(f"[MM] settle: {e}")
+
+
+def mm_init_db():
+    with db_lock:
+        conn = db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS mm_fills (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL, variant REAL, tf INTEGER, open_ts INTEGER, side TEXT, px REAL, shares REAL,
+            kind TEXT, fair_up REAL, btc REAL, secs_left REAL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS mm_mkts (variant REAL, tf INTEGER, open_ts INTEGER,
+            outcome TEXT, sh_up REAL, sh_dn REAL, cost REAL, payout REAL, rebate REAL, pnl REAL,
+            fills INTEGER, PRIMARY KEY (variant, tf, open_ts))""")
+        conn.commit()
+        conn.close()
+
+
+def mm_text(scope="today"):
+    since = today_start() if scope == "today" else 0
+    rows = db_query("SELECT * FROM mm_mkts WHERE open_ts >= ? ORDER BY open_ts", (since,))
+    lag = sorted(mm_stats["ws_lag"])
+    lag_s = f"{lag[len(lag) // 2]:.2f}s" if lag else "n/a"
+    lines = [f"🏦 <b>PAPER MARKET MAKER</b> · {MM_ASSET} {'/'.join(label_for(t) for t in MM_TFS)} · "
+             f"${MM_SIZE:g}/side · latency {MM_LAT:g}s · {'today' if scope == 'today' else 'all time'}",
+             f"feed: {mm_stats['ws_msgs']} ws msgs · {mm_stats['trades']} trades seen · median lag {lag_s} · "
+             f"rest polls {mm_stats['rest_polls']} · errors {mm_stats['errors']}"]
+    if not rows:
+        lines.append("no settled markets yet")
+        return "\n".join(lines)
+    for v in MM_HALF:
+        for tf in MM_TFS:
+            rs = [r for r in rows if r["variant"] == v and r["tf"] == tf]
+            if not rs:
+                continue
+            both = sum(1 for r in rs if r["sh_up"] > 0 and r["sh_dn"] > 0)
+            pnl = sum(r["pnl"] for r in rs)
+            reb = sum(r["rebate"] for r in rs)
+            vol = sum(r["cost"] for r in rs)
+            wins = sum(1 for r in rs if r["pnl"] > 0)
+            lines.append(f"±{v:g}¢ {label_for(tf)}: {len(rs)} mkts · both sides {both / len(rs) * 100:.0f}% · "
+                         f"traded ${vol:.0f} · {money(pnl)} (rebates {money(reb)}) · {wins}/{len(rs)} mkts +")
+    return "\n".join(lines)
+
+
+def mm_start():
+    if not MM_ENABLED:
+        return
+    mm_init_db()
+    for fn in (mm_loop, mm_ws_worker, mm_rest_worker, mm_settle_worker):
+        threading.Thread(target=fn, daemon=True).start()
+    log.info(f"[MM] paper market maker ON: {MM_ASSET} {MM_TFS} half-spreads {MM_HALF} size ${MM_SIZE}")
+
 
 
 def main():
@@ -1428,6 +1883,10 @@ def main():
     threading.Thread(target=grader, daemon=True).start()
     if SCAN_ENABLED:
         threading.Thread(target=scanner, daemon=True).start()
+    try:
+        mm_start()
+    except Exception as e:
+        log.error(f"[MM] start failed: {e}")
     while True:
         try:
             handle_commands()
