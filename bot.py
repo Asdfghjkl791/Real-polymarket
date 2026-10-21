@@ -1446,7 +1446,12 @@ MM_TFS = [int(x) for x in os.environ.get("MM_TFS", "5,15").split(",") if x.strip
 MM_SIZE = float(os.environ.get("MM_SIZE", "50"))                 # $ per side per window
 # v2 (Oct 20): quote around the MARKET midpoint; Binance is only a danger signal (pull quotes).
 # variant ids: 100+h = mid-h with guard, 200+h = mid-h without guard
-MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202").split(",") if x.strip()]
+# 300+h = mid-h with the ASK-PRESSURE guard only (v3, Oct 21): pull bids when the best ask on that
+#         token has stepped DOWN within the last MM_ASKP_SECS (sellers pushing toward us)
+MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202,301,302").split(",") if x.strip()]
+MM_ASKP_SECS = float(os.environ.get("MM_ASKP_SECS", "1.5"))
+MM_ASKP_PAUSE = float(os.environ.get("MM_ASKP_PAUSE", "3"))
+mm_ask_hist = {}     # token -> deque[(ts, best_ask)] (only when it changes)
 MM_GUARD_CENTS = float(os.environ.get("MM_GUARD_CENTS", "3"))      # model vs market disagreement
 MM_JUMP_BPS = float(os.environ.get("MM_JUMP_BPS", "4"))            # BTC move in last 3s that pulls quotes
 MM_MAX_SPREAD = float(os.environ.get("MM_MAX_SPREAD", "5"))        # don't quote wider books
@@ -1454,7 +1459,28 @@ MM_PAUSE_SECS = float(os.environ.get("MM_PAUSE_SECS", "5"))
 
 
 def mm_label(v):
+    if v >= 300:
+        return f"mid−{v - 300:g}¢ +ask guard"
     return f"mid−{v - 100:g}¢ +guard" if v < 200 else f"mid−{v - 200:g}¢ no guard"
+
+
+def mm_note_ask(token):
+    a = mm_best(token, "asks")
+    h = mm_ask_hist.setdefault(token, deque(maxlen=50))
+    if a is not None and (not h or h[-1][1] != a):
+        h.append((time.time(), a))
+
+
+def mm_ask_dropping(token, now):
+    """has the best ask on this token stepped down within the last MM_ASKP_SECS?"""
+    h = mm_ask_hist.get(token)
+    if not h or len(h) < 2:
+        return False
+    pts = list(h)
+    for (t0, a0), (t1, a1) in zip(pts, pts[1:]):
+        if t1 >= now - MM_ASKP_SECS and a1 < a0:
+            return True
+    return False
 
 
 def mm_jumped(now):
@@ -1516,6 +1542,7 @@ def mm_fair_up(tf, open_ts, now):
 def mm_book_set(token, bids, asks, ts=None):
     with mm_lock:
         mm_books[token] = {"bids": dict(bids), "asks": dict(asks), "ts": ts or time.time()}
+        mm_note_ask(token)
         mm_check_cross(token)
 
 
@@ -1529,6 +1556,7 @@ def mm_book_change(token, side, px, sz):
             lvl[px] = sz
         b["ts"] = time.time()
         if side != "BUY":
+            mm_note_ask(token)
             mm_check_cross(token)
 
 
@@ -1661,7 +1689,8 @@ def mm_step(now=None):
                         continue   # we didn't see this window open: skip it
                     st = mm_state[key] = mm_new_state(v, tf, open_ts)
                 guard = v < 200
-                h = v - 100 if guard else v - 200
+                askguard = v >= 300
+                h = v - 100 if guard else (v - 300 if askguard else v - 200)
                 quoting = (into >= MM_START_SECS and left >= MM_STOP_SECS and mid_up is not None
                            and MM_FAIR_MIN <= mid_up <= MM_FAIR_MAX and not (guard and paused))
                 for side, tok in (("UP", up_t), ("DOWN", dn_t)):
@@ -1682,6 +1711,13 @@ def mm_step(now=None):
                         continue
                     if not quoting:
                         if q["px"] is not None and not (q["pending"] and q["pending"][0] is None):
+                            q["pending"] = (None, now + MM_LAT)
+                        continue
+                    if askguard and (mm_ask_dropping(tok, now) or now < q.get("block_until", 0)):
+                        if mm_ask_dropping(tok, now):
+                            q["block_until"] = now + MM_ASKP_PAUSE
+                        cur = q["pending"][0] if q["pending"] else q["px"]
+                        if cur is not None:
                             q["pending"] = (None, now + MM_LAT)
                         continue
                     if side not in mids:
@@ -1877,7 +1913,7 @@ def mm_text(scope="today"):
              f"${MM_SIZE:g}/side · latency {MM_LAT:g}s · {'today' if scope == 'today' else 'all time'}",
              f"feed: {mm_stats['ws_msgs']} ws msgs · {mm_stats['trades']} trades seen · median lag {lag_s} · "
              f"rest polls {mm_stats['rest_polls']} · errors {mm_stats['errors']} · v2: quotes around market mid, "
-             f"pulls on >{MM_GUARD_CENTS:g}¢ disagreement or >{MM_JUMP_BPS:g}bp BTC jump"]
+             f"pulls on >{MM_GUARD_CENTS:g}¢ disagreement or >{MM_JUMP_BPS:g}bp BTC jump · v3 ask guard: pulls when sellers step down"]
     if not rows:
         lines.append("no settled markets yet")
         return "\n".join(lines)
