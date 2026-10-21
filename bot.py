@@ -1448,7 +1448,12 @@ MM_SIZE = float(os.environ.get("MM_SIZE", "50"))                 # $ per side pe
 # variant ids: 100+h = mid-h with guard, 200+h = mid-h without guard
 # 300+h = mid-h with the ASK-PRESSURE guard only (v3, Oct 21): pull bids when the best ask on that
 #         token has stepped DOWN within the last MM_ASKP_SECS (sellers pushing toward us)
-MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202,301,302").split(",") if x.strip()]
+# 400+h = v4 (Oct 21): mid-h no guard, bid ONLY a side priced <= MM_V4_MAX, and skip it when the
+#         Binance model says that side is worth more than MM_V4_MODEL cents less than our bid
+# 500+h = same as 400+h but without the model check (control)
+MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202,301,302,402,502").split(",") if x.strip()]
+MM_V4_MAX = float(os.environ.get("MM_V4_MAX", "50"))
+MM_V4_MODEL = float(os.environ.get("MM_V4_MODEL", "5"))
 MM_ASKP_SECS = float(os.environ.get("MM_ASKP_SECS", "1.5"))
 MM_ASKP_PAUSE = float(os.environ.get("MM_ASKP_PAUSE", "3"))
 mm_ask_hist = {}     # token -> deque[(ts, best_ask)] (only when it changes)
@@ -1459,6 +1464,10 @@ MM_PAUSE_SECS = float(os.environ.get("MM_PAUSE_SECS", "5"))
 
 
 def mm_label(v):
+    if v >= 500:
+        return f"v4 mid−{v - 500:g}¢ ≤{MM_V4_MAX:g}¢ only"
+    if v >= 400:
+        return f"v4 mid−{v - 400:g}¢ ≤{MM_V4_MAX:g}¢ +model check"
     if v >= 300:
         return f"mid−{v - 300:g}¢ +ask guard"
     return f"mid−{v - 100:g}¢ +guard" if v < 200 else f"mid−{v - 200:g}¢ no guard"
@@ -1689,8 +1698,17 @@ def mm_step(now=None):
                         continue   # we didn't see this window open: skip it
                     st = mm_state[key] = mm_new_state(v, tf, open_ts)
                 guard = v < 200
-                askguard = v >= 300
-                h = v - 100 if guard else (v - 300 if askguard else v - 200)
+                askguard = 300 <= v < 400
+                v4 = v >= 400
+                v4model = 400 <= v < 500
+                if guard:
+                    h = v - 100
+                elif askguard:
+                    h = v - 300
+                elif v4:
+                    h = v - (400 if v4model else 500)
+                else:
+                    h = v - 200
                 quoting = (into >= MM_START_SECS and left >= MM_STOP_SECS and mid_up is not None
                            and MM_FAIR_MIN <= mid_up <= MM_FAIR_MAX and not (guard and paused))
                 for side, tok in (("UP", up_t), ("DOWN", dn_t)):
@@ -1733,6 +1751,13 @@ def mm_step(now=None):
                     want = math.floor(want)
                     if want < 1:
                         want = None
+                    if v4 and want is not None:
+                        if want > MM_V4_MAX:
+                            want = None              # v4: only bid the cheap side (<= 50c)
+                        elif v4model and fair is not None:
+                            side_fair = fair if side == "UP" else 100.0 - fair
+                            if side_fair < want - MM_V4_MODEL:
+                                want = None          # v4: model says this side is losing -> don't bid
                     cur = q["pending"][0] if q["pending"] else q["px"]
                     if want is None:
                         if cur is not None:
@@ -1913,7 +1938,8 @@ def mm_text(scope="today"):
              f"${MM_SIZE:g}/side · latency {MM_LAT:g}s · {'today' if scope == 'today' else 'all time'}",
              f"feed: {mm_stats['ws_msgs']} ws msgs · {mm_stats['trades']} trades seen · median lag {lag_s} · "
              f"rest polls {mm_stats['rest_polls']} · errors {mm_stats['errors']} · v2: quotes around market mid, "
-             f"pulls on >{MM_GUARD_CENTS:g}¢ disagreement or >{MM_JUMP_BPS:g}bp BTC jump · v3 ask guard: pulls when sellers step down"]
+             f"pulls on >{MM_GUARD_CENTS:g}¢ disagreement or >{MM_JUMP_BPS:g}bp BTC jump · v3 ask guard: pulls when sellers step down · "
+             f"v4: bids only ≤{MM_V4_MAX:g}¢, model check skips bids >{MM_V4_MODEL:g}¢ above model"]
     if not rows:
         lines.append("no settled markets yet")
         return "\n".join(lines)
@@ -1938,7 +1964,7 @@ def mm_start():
     mm_init_db()
     for fn in (mm_loop, mm_ws_worker, mm_rest_worker, mm_settle_worker):
         threading.Thread(target=fn, daemon=True).start()
-    log.info(f"[MM] paper market maker v2 ON: {MM_ASSET} {MM_TFS} variants {MM_HALF} size ${MM_SIZE}")
+    log.info(f"[MM] paper market maker v4 ON: {MM_ASSET} {MM_TFS} variants {MM_HALF} size ${MM_SIZE}")
 
 
 
