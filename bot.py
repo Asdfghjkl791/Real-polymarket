@@ -187,6 +187,8 @@ def binance_ref_worker():
                     b, k = float(d.get("b", 0)), float(d.get("a", 0))
                     if b > 0 and k > 0:
                         prices_ref[a] = (b + k) / 2.0
+                        if a == "BTC" and JL_ENABLED and MM_ENABLED:
+                            jl_tick(time.time(), prices_ref[a])
         except Exception as e:
             log.warning(f"[REF] error: {e} — reconnecting")
         finally:
@@ -1391,6 +1393,15 @@ def run_command(t, args=()):
             tg("🏦 paper market maker is OFF — set MM_ENABLED=true in Railway to start it", force=True)
         else:
             tg(mm_text("all" if arg == "all" else "today"), force=True)
+    elif t == "/jumps":
+        tg(jl_text() if MM_ENABLED and JL_ENABLED else "⚡ jump logger is off (needs MM_ENABLED=true)", force=True)
+    elif t == "/jumpexport":
+        rows = db_query("SELECT * FROM mm_jumps ORDER BY jid, tf, off") if MM_ENABLED and JL_ENABLED else []
+        if rows:
+            tg_document("mm_jumps.csv.gz", gzip.compress(rows_to_csv(rows).encode()),
+                        f"{len(rows)} jump snapshots", "application/gzip")
+        else:
+            tg("no jumps logged yet", force=True)
     elif t == "/mmexport":
         rows = db_query("SELECT * FROM mm_mkts ORDER BY open_ts") if MM_ENABLED else []
         fills = db_query("SELECT * FROM mm_fills ORDER BY id") if MM_ENABLED else []
@@ -1424,6 +1435,7 @@ def run_command(t, args=()):
            "/history klines [days] — Binance 1m candles\n"
            "/tradehist 5m|15m|1h|1hall [days] — every past trade (price, size) — shows how much money can fit\n"
            "/mm · /mm all — paper market maker results · /mmexport — its fills + markets\n"
+           "/jumps — does Polymarket lag Binance? · /jumpexport — raw jump snapshots\n"
            "/mute · /unmute — hit messages off/on", force=True)
 
 
@@ -1448,12 +1460,28 @@ MM_SIZE = float(os.environ.get("MM_SIZE", "50"))                 # $ per side pe
 # variant ids: 100+h = mid-h with guard, 200+h = mid-h without guard
 # 300+h = mid-h with the ASK-PRESSURE guard only (v3, Oct 21): pull bids when the best ask on that
 #         token has stepped DOWN within the last MM_ASKP_SECS (sellers pushing toward us)
-# 400+h = v4 (Oct 21): mid-h no guard, bid ONLY a side priced <= MM_V4_MAX, and skip it when the
-#         Binance model says that side is worth more than MM_V4_MODEL cents less than our bid
+# 400+h = v4 (Oct 22): mid-h no guard, 15m only, bid ONLY a side priced <= MM_V4_MAX, and skip it when
+#         BTC has moved more than MM_V4_TREND % AGAINST that side over the last hour (trend stop)
+#         (Oct 22 update: 5m + 15m, and bids must be 35-50c: under-35c bids caused the Oct 21-22 night loss)
 # 500+h = same as 400+h but without the model check (control)
-MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202,301,302,402,502").split(",") if x.strip()]
+MM_HALF = [float(x) for x in os.environ.get("MM_VARIANTS", "101,102,103,202,301,302,402,502,602").split(",") if x.strip()]
 MM_V4_MAX = float(os.environ.get("MM_V4_MAX", "50"))
-MM_V4_MODEL = float(os.environ.get("MM_V4_MODEL", "5"))
+MM_V4_MIN = float(os.environ.get("MM_V4_MIN", "35"))           # v4 also skips bids below 35c (Oct 22)
+MM_V4_TREND = float(os.environ.get("MM_V4_TREND", "0.25"))     # % BTC move in 1h against our side
+MM_V4_TFS = [int(x) for x in os.environ.get("MM_V4_TFS", "5,15").split(",") if x.strip()]
+
+
+def mm_btc_move_1h(now):
+    """% change of BTC over the last ~hour from the 1s samples (None until we have an hour)"""
+    px = prices_ref.get(MM_ASSET)
+    if not px or not mm_btc or mm_btc[0][0] > now - 3300:
+        return None
+    old = None
+    for t, p in mm_btc:
+        if t >= now - 3600:
+            old = p
+            break
+    return (px / old - 1) * 100 if old else None
 MM_ASKP_SECS = float(os.environ.get("MM_ASKP_SECS", "1.5"))
 MM_ASKP_PAUSE = float(os.environ.get("MM_ASKP_PAUSE", "3"))
 mm_ask_hist = {}     # token -> deque[(ts, best_ask)] (only when it changes)
@@ -1464,10 +1492,12 @@ MM_PAUSE_SECS = float(os.environ.get("MM_PAUSE_SECS", "5"))
 
 
 def mm_label(v):
+    if v >= 600:
+        return f"v4 mid−{v - 600:g}¢ {MM_V4_MIN:g}-{MM_V4_MAX:g}¢ +trend stop +model agrees"
     if v >= 500:
-        return f"v4 mid−{v - 500:g}¢ ≤{MM_V4_MAX:g}¢ only"
+        return f"v4 mid−{v - 500:g}¢ {MM_V4_MIN:g}-{MM_V4_MAX:g}¢ only"
     if v >= 400:
-        return f"v4 mid−{v - 400:g}¢ ≤{MM_V4_MAX:g}¢ +model check"
+        return f"v4 mid−{v - 400:g}¢ {MM_V4_MIN:g}-{MM_V4_MAX:g}¢ +trend stop"
     if v >= 300:
         return f"mid−{v - 300:g}¢ +ask guard"
     return f"mid−{v - 100:g}¢ +guard" if v < 200 else f"mid−{v - 200:g}¢ no guard"
@@ -1511,7 +1541,7 @@ mm_lock = threading.RLock()
 mm_books = {}        # token -> {"bids": {px: sz}, "asks": {px: sz}, "ts": t}
 mm_tokmap = {}       # token -> (tf, open_ts, "UP"/"DOWN", other_token)
 mm_state = {}        # (variant, tf, open_ts) -> dict
-mm_btc = deque(maxlen=3600)     # (ts, price) ~1/s
+mm_btc = deque(maxlen=4000)     # (ts, price) ~1/s
 mm_stats = {"ws_msgs": 0, "ws_last": 0.0, "ws_lag": deque(maxlen=500), "trades": 0,
             "rest_polls": 0, "started": time.time(), "errors": 0}
 mm_ws_holder = {"ws": None, "tokens": ()}
@@ -1691,6 +1721,8 @@ def mm_step(now=None):
                 mm_stats["pause_until"] = max(mm_stats.get("pause_until", 0), now + MM_PAUSE_SECS)
             paused = now < mm_stats.get("pause_until", 0)
             for v in MM_HALF:
+                if v >= 400 and tf not in MM_V4_TFS:
+                    continue       # v4 runs on 15m only
                 key = (v, tf, open_ts)
                 st = mm_state.get(key)
                 if st is None:
@@ -1700,13 +1732,14 @@ def mm_step(now=None):
                 guard = v < 200
                 askguard = 300 <= v < 400
                 v4 = v >= 400
-                v4model = 400 <= v < 500
+                v4trend = 400 <= v < 500 or v >= 600
+                v4agree = v >= 600
                 if guard:
                     h = v - 100
                 elif askguard:
                     h = v - 300
                 elif v4:
-                    h = v - (400 if v4model else 500)
+                    h = v - (600 if v4agree else 400 if v4trend else 500)
                 else:
                     h = v - 200
                 quoting = (into >= MM_START_SECS and left >= MM_STOP_SECS and mid_up is not None
@@ -1752,12 +1785,14 @@ def mm_step(now=None):
                     if want < 1:
                         want = None
                     if v4 and want is not None:
-                        if want > MM_V4_MAX:
-                            want = None              # v4: only bid the cheap side (<= 50c)
-                        elif v4model and fair is not None:
-                            side_fair = fair if side == "UP" else 100.0 - fair
-                            if side_fair < want - MM_V4_MODEL:
-                                want = None          # v4: model says this side is losing -> don't bid
+                        if want > MM_V4_MAX or want < MM_V4_MIN:
+                            want = None              # v4: only bid the cheap side, 35-50c
+                        elif v4trend:
+                            mv = mm_btc_move_1h(now)
+                            if mv is not None and (mv if side == "UP" else -mv) <= -MM_V4_TREND:
+                                want = None          # v4: BTC trending against this side -> don't bid
+                            elif v4agree and (fair is None or (fair if side == "UP" else 100.0 - fair) < want):
+                                want = None          # v4 602: Binance model must value this side >= our bid
                     cur = q["pending"][0] if q["pending"] else q["px"]
                     if want is None:
                         if cur is not None:
@@ -1939,7 +1974,7 @@ def mm_text(scope="today"):
              f"feed: {mm_stats['ws_msgs']} ws msgs · {mm_stats['trades']} trades seen · median lag {lag_s} · "
              f"rest polls {mm_stats['rest_polls']} · errors {mm_stats['errors']} · v2: quotes around market mid, "
              f"pulls on >{MM_GUARD_CENTS:g}¢ disagreement or >{MM_JUMP_BPS:g}bp BTC jump · v3 ask guard: pulls when sellers step down · "
-             f"v4: bids only ≤{MM_V4_MAX:g}¢, model check skips bids >{MM_V4_MODEL:g}¢ above model"]
+             f"v4: bids only {MM_V4_MIN:g}-{MM_V4_MAX:g}¢, {'/'.join(label_for(t) for t in MM_V4_TFS)} only, trend stop >{MM_V4_TREND:g}% against in 1h"]
     if not rows:
         lines.append("no settled markets yet")
         return "\n".join(lines)
@@ -1958,12 +1993,147 @@ def mm_text(scope="today"):
     return "\n".join(lines)
 
 
+
+# ── JUMP LOGGER (paper, Oct 22): does Polymarket lag Binance? ─────────────────────────────────
+# Every time BTC moves >= JL_BPS within JL_WINDOW seconds on Binance, snapshot the BTC 5m/15m
+# UP/DOWN books right then and at +0.1 ... +10 s. No orders. Read with /jumps and /jumpexport.
+JL_ENABLED = env_bool("JL_ENABLED", "true")
+JL_BPS = float(os.environ.get("JL_BPS", "5"))
+JL_WINDOW = float(os.environ.get("JL_WINDOW", "2"))
+JL_COOLDOWN = float(os.environ.get("JL_COOLDOWN", "10"))
+JL_OFFSETS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+jl_ticks = deque(maxlen=5000)       # (ts, btc) every Binance update
+jl_pending = []                     # events waiting for their later snapshots
+jl_lock = threading.Lock()
+jl_state = {"last": 0.0, "events": 0}
+
+
+def jl_tick(now, px):
+    with jl_lock:
+        jl_ticks.append((now, px))
+        while jl_ticks and jl_ticks[0][0] < now - JL_WINDOW:
+            jl_ticks.popleft()                   # keep only the last JL_WINDOW seconds
+        if now - jl_state["last"] < JL_COOLDOWN or len(jl_ticks) < 2:
+            return
+        old = jl_ticks[0][1]
+        bps = (px / old - 1) * 1e4
+        if abs(bps) < JL_BPS:
+            return
+        jl_state["last"] = now
+        jl_state["events"] += 1
+        jl_pending.append({"id": int(now * 1000), "t0": now, "bps": round(bps, 2), "done": set()})
+
+
+def jl_books_now():
+    """current BTC books for each MM timeframe's live window -> list of (tf, open_ts, ub, ua, db, da)"""
+    out = []
+    with mm_lock:
+        live = {}
+        for tok, (tf, open_ts, side, other) in mm_tokmap.items():
+            if open_ts <= time.time() < open_ts + tf * 60:
+                live.setdefault((tf, open_ts), {})[side] = tok
+        for (tf, open_ts), toks in live.items():
+            if "UP" in toks and "DOWN" in toks:
+                u, d = toks["UP"], toks["DOWN"]
+                out.append((tf, open_ts, mm_best(u, "bids"), mm_best(u, "asks"),
+                            mm_best(d, "bids"), mm_best(d, "asks")))
+    return out
+
+
+def jl_worker():
+    while True:
+        try:
+            time.sleep(0.02)
+            now = time.time()
+            with jl_lock:
+                todo = []
+                for ev in jl_pending:
+                    for off in JL_OFFSETS:
+                        if off not in ev["done"] and now >= ev["t0"] + off:
+                            ev["done"].add(off)
+                            todo.append((ev, off))
+                jl_pending[:] = [e for e in jl_pending if len(e["done"]) < len(JL_OFFSETS)]
+            if not todo:
+                continue
+            btc = prices_ref.get("BTC")
+            books = jl_books_now()
+            rows = []
+            for ev, off in todo:
+                for tf, open_ts, ub, ua, dbid, da in books:
+                    fair = mm_fair_up(tf, open_ts, ev["t0"]) if off == 0 else None
+                    rows.append((ev["id"], ev["t0"], ev["bps"], tf, open_ts, off, round(now - ev["t0"], 3),
+                                 btc, ub, ua, dbid, da, round(open_ts + tf * 60 - ev["t0"], 1),
+                                 round(fair, 2) if fair is not None else None))
+            if rows:
+                with db_lock:
+                    conn = db()
+                    conn.executemany("INSERT INTO mm_jumps (jid,t0,bps,tf,open_ts,off,real_dt,btc,up_bid,up_ask,"
+                                     "dn_bid,dn_ask,secs_left,fair_up) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                    conn.commit()
+                    conn.close()
+        except Exception as e:
+            log.error(f"[JL] {e}")
+            time.sleep(1)
+
+
+def jl_init_db():
+    with db_lock:
+        conn = db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS mm_jumps (jid INTEGER, t0 REAL, bps REAL, tf INTEGER,
+            open_ts INTEGER, off REAL, real_dt REAL, btc REAL, up_bid REAL, up_ask REAL, dn_bid REAL,
+            dn_ask REAL, secs_left REAL, fair_up REAL)""")
+        conn.commit()
+        conn.close()
+
+
+def jl_text():
+    rows = db_query("SELECT * FROM mm_jumps WHERE t0 >= ? ORDER BY jid, tf, off", (time.time() - 86400,))
+    lines = [f"⚡ <b>JUMP LOGGER</b> · BTC moves ≥{JL_BPS:g}bp in {JL_WINDOW:g}s · last 24h",
+             f"events since restart: {jl_state['events']}"]
+    if not rows:
+        lines.append("no jumps logged yet")
+        return "\n".join(lines)
+    ev = {}
+    for r in rows:
+        ev.setdefault((r["jid"], r["tf"]), {})[r["off"]] = r
+    for tf in (5, 15):
+        moves = {off: [] for off in JL_OFFSETS if off > 0}
+        n = 0
+        for (jid, t2), snaps in ev.items():
+            if t2 != tf or 0.0 not in snaps:
+                continue
+            s0 = snaps[0.0]
+            up = s0["bps"] > 0
+            a0 = s0["up_ask"] if up else s0["dn_ask"]      # ask of the side the jump favours
+            if a0 is None:
+                continue
+            n += 1
+            for off in moves:
+                s = snaps.get(off)
+                a = (s["up_ask"] if up else s["dn_ask"]) if s else None
+                if a is not None:
+                    moves[off].append(a - a0)
+        if not n:
+            continue
+        def med(v):
+            v = sorted(v)
+            return f"{v[len(v) // 2]:+.1f}¢" if v else "n/a"
+        lines.append(f"{label_for(tf)}: {n} jumps · ask of the favoured side vs jump moment: " +
+                     " · ".join(f"+{off:g}s {med(v)}" for off, v in moves.items()))
+    lines.append("a rising ask after the jump = Polymarket was slow (a chance to buy before it moves)")
+    return "\n".join(lines)
+
+
 def mm_start():
     if not MM_ENABLED:
         return
     mm_init_db()
     for fn in (mm_loop, mm_ws_worker, mm_rest_worker, mm_settle_worker):
         threading.Thread(target=fn, daemon=True).start()
+    if JL_ENABLED:
+        jl_init_db()
+        threading.Thread(target=jl_worker, daemon=True).start()
+        log.info(f"[JL] jump logger ON: BTC >= {JL_BPS}bp in {JL_WINDOW}s")
     log.info(f"[MM] paper market maker v4 ON: {MM_ASSET} {MM_TFS} variants {MM_HALF} size ${MM_SIZE}")
 
 
