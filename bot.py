@@ -2002,6 +2002,7 @@ JL_BPS = float(os.environ.get("JL_BPS", "5"))
 JL_WINDOW = float(os.environ.get("JL_WINDOW", "2"))
 JL_COOLDOWN = float(os.environ.get("JL_COOLDOWN", "10"))
 JL_OFFSETS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+JL_STAKE = float(os.environ.get("JL_STAKE", "50"))
 jl_ticks = deque(maxlen=5000)       # (ts, btc) every Binance update
 jl_pending = []                     # events waiting for their later snapshots
 jl_lock = threading.Lock()
@@ -2024,8 +2025,16 @@ def jl_tick(now, px):
         jl_pending.append({"id": int(now * 1000), "t0": now, "bps": round(bps, 2), "done": set()})
 
 
+def jl_depth(tok, best, cents=2.0):
+    """$ offered on the asks from the best ask up to best+cents"""
+    b = mm_books.get(tok)
+    if not b or best is None:
+        return None
+    return round(sum(px * sz / 100.0 for px, sz in b["asks"].items() if px <= best + cents + 1e-9), 2)
+
+
 def jl_books_now():
-    """current BTC books for each MM timeframe's live window -> list of (tf, open_ts, ub, ua, db, da)"""
+    """current BTC books for each MM timeframe's live window -> list of (tf, open_ts, ub, ua, db, da, ua$, da$)"""
     out = []
     with mm_lock:
         live = {}
@@ -2035,8 +2044,9 @@ def jl_books_now():
         for (tf, open_ts), toks in live.items():
             if "UP" in toks and "DOWN" in toks:
                 u, d = toks["UP"], toks["DOWN"]
-                out.append((tf, open_ts, mm_best(u, "bids"), mm_best(u, "asks"),
-                            mm_best(d, "bids"), mm_best(d, "asks")))
+                ua, da = mm_best(u, "asks"), mm_best(d, "asks")
+                out.append((tf, open_ts, mm_best(u, "bids"), ua, mm_best(d, "bids"), da,
+                            jl_depth(u, ua), jl_depth(d, da)))
     return out
 
 
@@ -2059,16 +2069,16 @@ def jl_worker():
             books = jl_books_now()
             rows = []
             for ev, off in todo:
-                for tf, open_ts, ub, ua, dbid, da in books:
+                for tf, open_ts, ub, ua, dbid, da, uad, dad in books:
                     fair = mm_fair_up(tf, open_ts, ev["t0"]) if off == 0 else None
                     rows.append((ev["id"], ev["t0"], ev["bps"], tf, open_ts, off, round(now - ev["t0"], 3),
                                  btc, ub, ua, dbid, da, round(open_ts + tf * 60 - ev["t0"], 1),
-                                 round(fair, 2) if fair is not None else None))
+                                 round(fair, 2) if fair is not None else None, uad, dad))
             if rows:
                 with db_lock:
                     conn = db()
                     conn.executemany("INSERT INTO mm_jumps (jid,t0,bps,tf,open_ts,off,real_dt,btc,up_bid,up_ask,"
-                                     "dn_bid,dn_ask,secs_left,fair_up) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                                     "dn_bid,dn_ask,secs_left,fair_up,up_ask_usd,dn_ask_usd) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
                     conn.commit()
                     conn.close()
         except Exception as e:
@@ -2082,6 +2092,10 @@ def jl_init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS mm_jumps (jid INTEGER, t0 REAL, bps REAL, tf INTEGER,
             open_ts INTEGER, off REAL, real_dt REAL, btc REAL, up_bid REAL, up_ask REAL, dn_bid REAL,
             dn_ask REAL, secs_left REAL, fair_up REAL)""")
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(mm_jumps)").fetchall()]
+        for c in ("up_ask_usd", "dn_ask_usd"):
+            if c not in cols:
+                conn.execute(f"ALTER TABLE mm_jumps ADD COLUMN {c} REAL")
         conn.commit()
         conn.close()
 
@@ -2120,6 +2134,24 @@ def jl_text():
             return f"{v[len(v) // 2]:+.1f}¢" if v else "n/a"
         lines.append(f"{label_for(tf)}: {n} jumps · ask of the favoured side vs jump moment: " +
                      " · ".join(f"+{off:g}s {med(v)}" for off, v in moves.items()))
+    # paper sniper: buy the favoured side at the +0.25s ask ($JL_STAKE, capped by $ on offer within 2c),
+    # sell at the +2s bid; taker fee both ways. Only when the ask is 5-95c.
+    tot, n_tr = 0.0, 0
+    for (jid, t2), snaps in ev.items():
+        a_s, b_s = snaps.get(0.25), snaps.get(2.0)
+        if not a_s or not b_s:
+            continue
+        up = a_s["bps"] > 0
+        a = a_s["up_ask"] if up else a_s["dn_ask"]
+        b = b_s["up_bid"] if up else b_s["dn_bid"]
+        dep = (a_s["up_ask_usd"] if up else a_s["dn_ask_usd"]) if "up_ask_usd" in a_s.keys() else None
+        if a is None or b is None or not (5 <= a <= 95):
+            continue
+        stake = min(JL_STAKE, dep) if dep else JL_STAKE
+        sh = stake / (a / 100.0)
+        tot += sh * b / 100.0 - stake - fee_for(sh, a / 100.0) - fee_for(sh, b / 100.0)
+        n_tr += 1
+    lines.append(f"paper sniper (buy at +0.25s ask, sell at +2s bid, ${JL_STAKE:g}): {n_tr} trades · {money(tot)}")
     lines.append("a rising ask after the jump = Polymarket was slow (a chance to buy before it moves)")
     return "\n".join(lines)
 
