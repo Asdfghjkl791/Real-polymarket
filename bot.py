@@ -2015,6 +2015,7 @@ jl_ticks = {a: deque(maxlen=5000) for a in JL_ASSETS}   # (ts, price) every Bina
 jl_pending = []                     # events waiting for their later snapshots
 jl_lock = threading.Lock()
 jl_state = {"last": {a: 0.0 for a in JL_ASSETS}, "events": {a: 0 for a in JL_ASSETS}}
+jl_px1s = {a: deque(maxlen=1200) for a in JL_ASSETS}    # (ts, price) ~1/s per coin, for the fair-price model
 # own Polymarket books for coins other than the market maker's coin
 jl_books = {}                       # token -> {"bids": {px: sz}, "asks": {px: sz}}
 jl_tok = {}                         # (asset, tf, open_ts) -> (up_token, dn_token)
@@ -2025,6 +2026,9 @@ def jl_tick(asset, now, px):
     with jl_lock:
         dq = jl_ticks[asset]
         dq.append((now, px))
+        p1 = jl_px1s[asset]
+        if not p1 or now - p1[-1][0] >= 1.0:
+            p1.append((now, px))
         while dq and dq[0][0] < now - JL_WINDOW:
             dq.popleft()                         # keep only the last JL_WINDOW seconds
         if now - jl_state["last"][asset] < JL_COOLDOWN or len(dq) < 2:
@@ -2035,6 +2039,29 @@ def jl_tick(asset, now, px):
         jl_state["last"][asset] = now
         jl_state["events"][asset] += 1
         jl_pending.append({"id": int(now * 1000), "asset": asset, "t0": now, "bps": round(bps, 2), "done": set()})
+
+
+def jl_sigma(asset):
+    """per-second vol of a coin from ~1s samples over the last 15 min (same recipe as mm_sigma)"""
+    if asset == MM_ASSET:
+        return mm_sigma()
+    pts = [p for p in jl_px1s.get(asset, ()) if p[0] >= time.time() - 900]
+    r = [(math.log(p1 / p0)) ** 2 / (t1 - t0) for (t0, p0), (t1, p1) in zip(pts, pts[1:]) if t1 > t0 and p0 > 0 and p1 > 0]
+    if len(r) < 30:
+        return 6e-5
+    return max(2e-5, math.sqrt(sum(r) / len(r)))
+
+
+def jl_fair_up(asset, tf, open_ts, now):
+    """model chance (0-100) that UP wins, from the coin's move since the window opened"""
+    if asset == MM_ASSET:
+        return mm_fair_up(tf, open_ts, now)
+    op = open_ref.get((tf, open_ts), {}).get(asset)
+    px = prices_ref.get(asset)
+    left = open_ts + tf * 60 - now
+    if not op or not px or left <= 0:
+        return None
+    return 100.0 * mm_norm_cdf(math.log(px / op) / (jl_sigma(asset) * math.sqrt(left)))
 
 
 def _jl_best(b, kind):
@@ -2179,7 +2206,7 @@ def jl_worker():
                     cache[a] = (prices_ref.get(a), jl_books_now(a))
                 px, books = cache[a]
                 for tf, open_ts, ub, ua, dbid, da, uad, dad in books:
-                    fair = mm_fair_up(tf, open_ts, ev["t0"]) if (off == 0 and a == MM_ASSET) else None
+                    fair = jl_fair_up(a, tf, open_ts, ev["t0"]) if off == 0 else None
                     rows.append((ev["id"], ev["t0"], ev["bps"], tf, open_ts, off, round(now - ev["t0"], 3),
                                  px, ub, ua, dbid, da, round(open_ts + tf * 60 - ev["t0"], 1),
                                  round(fair, 2) if fair is not None else None, uad, dad, a))
@@ -2247,12 +2274,27 @@ def jl_text():
                 return f"{v[len(v) // 2]:+.1f}¢" if v else "n/a"
             lines.append(f"{a} {label_for(tf)}: {n} jumps · favoured side's ask vs jump moment: " +
                          " · ".join(f"+{off:g}s {med(v)}" for off, v in moves.items()))
-    # paper sniper: buy the favoured side at the +0.25s ask ($JL_STAKE, capped by $ on offer within 2c),
-    # sell at the +2s bid; taker fee both ways. Only when the ask is 5-95c.
-    tot = {a: [0.0, 0] for a in JL_ASSETS}
+    # paper sniper versions: buy the favoured side at the +0.25s ask ($JL_STAKE, capped by $ on offer within 2c),
+    # sell at the +5s bid; taker fee both ways. Only when the ask is 5-95c.
+    #   calm = 5+ min since that coin's previous jump · edge = model fair price minus the ask we pay
+    vers = [("every jump", lambda x, e, g: True),
+            ("calm 5+ min + <85c", lambda x, e, g: g > 300 and x < 85),
+            ("edge 10+ + <85c", lambda x, e, g: e is not None and e >= 10 and x < 85),
+            ("edge 20+", lambda x, e, g: e is not None and e >= 20)]
+    tot = {(a, k): [0.0, 0, 0] for a in JL_ASSETS for k, _ in vers}
+    t0s = {}
     for (a, jid, t2), snaps in ev.items():
-        a_s, b_s = snaps.get(0.25), snaps.get(2.0)
-        if not a_s or not b_s or a not in tot:
+        if 0.0 in snaps:
+            t0s.setdefault(a, set()).add((snaps[0.0]["t0"], jid))
+    gaps = {}
+    for a, s in t0s.items():
+        prev = None
+        for t0, jid in sorted(s):
+            gaps[(a, jid)] = (t0 - prev) if prev is not None else 99999
+            prev = t0
+    for (a, jid, t2), snaps in ev.items():
+        a_s, b_s, z_s = snaps.get(0.25), snaps.get(5.0), snaps.get(0.0)
+        if not a_s or not b_s or not z_s or a not in JL_ASSETS:
             continue
         up = a_s["bps"] > 0
         x = a_s["up_ask"] if up else a_s["dn_ask"]
@@ -2260,12 +2302,23 @@ def jl_text():
         dep = a_s["up_ask_usd"] if up else a_s["dn_ask_usd"]
         if x is None or b is None or not (5 <= x <= 95):
             continue
+        fu = z_s["fair_up"]
+        e = None if fu is None else (fu if up else 100 - fu) - x
+        g = gaps.get((a, jid), 99999)
         stake = min(JL_STAKE, dep) if dep else JL_STAKE
         sh = stake / (x / 100.0)
-        tot[a][0] += sh * b / 100.0 - stake - fee_for(sh, x / 100.0) - fee_for(sh, b / 100.0)
-        tot[a][1] += 1
-    lines.append(f"paper sniper (every jump, buy at +0.25s ask, sell at +2s bid, ${JL_STAKE:g}): " +
-                 " · ".join(f"{a} {n} trades {money(v)}" for a, (v, n) in tot.items()))
+        pnl = sh * b / 100.0 - stake - fee_for(sh, x / 100.0) - fee_for(sh, b / 100.0)
+        for k, f in vers:
+            if f(x, e, g):
+                tt = tot[(a, k)]
+                tt[0] += pnl
+                tt[1] += 1
+                tt[2] += pnl > 0
+    lines.append(f"<b>paper sniper</b> · last 24h · buy at +0.25s ask, sell at +5s bid, ${JL_STAKE:g}, after fees:")
+    for a in JL_ASSETS:
+        lines.append(f"{a}: " + " · ".join(
+            f"{k} {n} tr {money(v)}" + (f" ({w * 100 // n}% win)" if n else "")
+            for k, _ in vers for v, n, w in [tot[(a, k)]]))
     lines.append("a rising ask after the jump = Polymarket was slow (a chance to buy before it moves)")
     return "\n".join(lines)
 
