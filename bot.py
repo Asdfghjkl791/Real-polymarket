@@ -1105,16 +1105,18 @@ def _one_market(a, tf, o):
     return res
 
 
-def history_tf(tf, days):
+def history_tf(tf, days, sundays=False):
     try:
         wins = _hist_windows(tf, days)
-        if tf == 5:   # 5m: weekday mornings only (8:30-11:30 ET) to keep it small
+        if sundays:   # every market on Sundays (ET), all hours (added Oct 25)
+            wins = [o for o in wins if datetime.fromtimestamp(o, tz=ET).weekday() == 6]
+        elif tf == 5:   # 5m: weekday mornings only (8:30-11:30 ET) to keep it small
             def _keep(o):
                 d = datetime.fromtimestamp(o, tz=ET)
                 return d.weekday() < 5 and 510 <= d.hour * 60 + d.minute < 690
             wins = [o for o in wins if _keep(o)]
         jobs = [(a, tf, o) for o in wins for a in COINS]
-        lab = label_for(tf)
+        lab = label_for(tf) + ("sun" if sundays else "")
         tg(f"⏳ /history {lab}: {len(jobs)} markets to fetch", force=True)
         mpath = os.path.join(HIST_DIR, f"hist_{lab}_mkts.csv")
         ppath = os.path.join(HIST_DIR, f"hist_{lab}_prices.csv.gz")
@@ -1351,14 +1353,15 @@ def run_command(t, args=()):
                f"3 files will arrive", force=True)
             threading.Thread(target=daily_history, args=(days,), daemon=True).start()
     elif t == "/history":
-        which = args[0] if args and args[0] in ("klines", "4h", "1h", "15m", "5m") else ""
+        which = args[0] if args and args[0] in ("klines", "4h", "1h", "15m", "5m", "5msun", "15msun") else ""
         nums = [a for a in args[1:] if a.replace(".", "").isdigit()]
         try:
             days = max(1, min(90, int(float(nums[0])))) if nums else 60
         except ValueError:
             days = 60
         if not which:
-            tg("use: /history 4h 60 · /history 1h 60 · /history 15m 30 · /history 5m 60 · /history klines 60",
+            tg("use: /history 4h 60 · /history 1h 60 · /history 15m 30 · /history 5m 60 · /history klines 60 · "
+               "/history 5msun 60 (every 5m market on Sundays, all hours)",
                force=True)
         elif _hist2_running.is_set():
             tg("⏳ a /history run is already going — wait for its files", force=True)
@@ -1368,8 +1371,9 @@ def run_command(t, args=()):
                 tg(f"⏳ pulling {days} days of Binance 1m candles…", force=True)
                 threading.Thread(target=history_klines, args=(days,), daemon=True).start()
             else:
-                tfv = parse_tf(which)
-                threading.Thread(target=history_tf, args=(tfv, days), daemon=True).start()
+                sun = which.endswith("sun")
+                tfv = parse_tf(which[:-3] if sun else which)
+                threading.Thread(target=history_tf, args=(tfv, days, sun), daemon=True).start()
     elif t == "/tradehist":
         presets = {"5m": (5, ["BTC", "ETH", "SOL", "XRP", "DOGE"], (540, 660)),    # weekday 9-11am
                    "15m": (15, ["BTC", "ETH", "SOL", "XRP", "DOGE"], (540, 660)),
