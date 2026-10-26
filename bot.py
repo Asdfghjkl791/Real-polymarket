@@ -2077,6 +2077,17 @@ def _jl_depth(b, best, cents=2.0):
     return round(sum(px * sz / 100.0 for px, sz in b["asks"].items() if px <= best + cents + 1e-9), 2)
 
 
+def _jl_ladder(bu, bd, n=6):
+    """top n price levels (cents, shares) of each side's asks and bids, as compact JSON"""
+    def lv(b, kind):
+        if not b or not b[kind]:
+            return []
+        ks = sorted(b[kind], reverse=(kind == "bids"))[:n]
+        return [[k, round(b[kind][k], 1)] for k in ks]
+    return json.dumps({"ua": lv(bu, "asks"), "ub": lv(bu, "bids"), "da": lv(bd, "asks"), "db": lv(bd, "bids")},
+                      separators=(",", ":"))
+
+
 def jl_books_now(asset):
     """current books of the coin's live 5m/15m windows -> list of (tf, open_ts, ub, ua, db, da, ua$, da$)"""
     out, now = [], time.time()
@@ -2091,7 +2102,7 @@ def jl_books_now(asset):
                     bu, bd = mm_books.get(toks["UP"]), mm_books.get(toks["DOWN"])
                     ua, da = _jl_best(bu, "asks"), _jl_best(bd, "asks")
                     out.append((tf, open_ts, _jl_best(bu, "bids"), ua, _jl_best(bd, "bids"), da,
-                                _jl_depth(bu, ua), _jl_depth(bd, da)))
+                                _jl_depth(bu, ua), _jl_depth(bd, da), _jl_ladder(bu, bd)))
         return out
     with jl_book_lock:
         for (a, tf, open_ts), (u, d) in jl_tok.items():
@@ -2100,7 +2111,7 @@ def jl_books_now(asset):
             bu, bd = jl_books.get(u), jl_books.get(d)
             ua, da = _jl_best(bu, "asks"), _jl_best(bd, "asks")
             out.append((tf, open_ts, _jl_best(bu, "bids"), ua, _jl_best(bd, "bids"), da,
-                        _jl_depth(bu, ua), _jl_depth(bd, da)))
+                        _jl_depth(bu, ua), _jl_depth(bd, da), _jl_ladder(bu, bd)))
     return out
 
 
@@ -2205,17 +2216,17 @@ def jl_worker():
                 if a not in cache:
                     cache[a] = (prices_ref.get(a), jl_books_now(a))
                 px, books = cache[a]
-                for tf, open_ts, ub, ua, dbid, da, uad, dad in books:
+                for tf, open_ts, ub, ua, dbid, da, uad, dad, lad in books:
                     fair = jl_fair_up(a, tf, open_ts, ev["t0"]) if off == 0 else None
                     rows.append((ev["id"], ev["t0"], ev["bps"], tf, open_ts, off, round(now - ev["t0"], 3),
                                  px, ub, ua, dbid, da, round(open_ts + tf * 60 - ev["t0"], 1),
-                                 round(fair, 2) if fair is not None else None, uad, dad, a))
+                                 round(fair, 2) if fair is not None else None, uad, dad, a, lad))
             if rows:
                 with db_lock:
                     conn = db()
                     conn.executemany("INSERT INTO mm_jumps (jid,t0,bps,tf,open_ts,off,real_dt,btc,up_bid,up_ask,"
-                                     "dn_bid,dn_ask,secs_left,fair_up,up_ask_usd,dn_ask_usd,asset) "
-                                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                                     "dn_bid,dn_ask,secs_left,fair_up,up_ask_usd,dn_ask_usd,asset,ladder) "
+                                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
                     conn.commit()
                     conn.close()
         except Exception as e:
@@ -2230,7 +2241,7 @@ def jl_init_db():
             open_ts INTEGER, off REAL, real_dt REAL, btc REAL, up_bid REAL, up_ask REAL, dn_bid REAL,
             dn_ask REAL, secs_left REAL, fair_up REAL)""")
         cols = [r[1] for r in conn.execute("PRAGMA table_info(mm_jumps)").fetchall()]
-        for c, typ in (("up_ask_usd", "REAL"), ("dn_ask_usd", "REAL"), ("asset", "TEXT")):
+        for c, typ in (("up_ask_usd", "REAL"), ("dn_ask_usd", "REAL"), ("asset", "TEXT"), ("ladder", "TEXT")):
             if c not in cols:
                 conn.execute(f"ALTER TABLE mm_jumps ADD COLUMN {c} {typ}")
         conn.commit()
