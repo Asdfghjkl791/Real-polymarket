@@ -2005,7 +2005,8 @@ def mm_text(scope="today"):
 # Read with /jumps and /jumpexport.
 JL_ENABLED = env_bool("JL_ENABLED", "true")
 JL_ASSETS = [a.strip().upper() for a in os.environ.get("JL_ASSETS", "BTC,ETH,SOL").split(",") if a.strip()]
-JL_TFS = (5, 15)
+JL_TFS = tuple(int(x) for x in os.environ.get("JL_TFS", "5,15").split(",") if x.strip())
+JL_MM_TFS = (5, 15)      # BTC 5m/15m books come from the market maker feed; everything else from the jump feed
 JL_BPS = float(os.environ.get("JL_BPS", "5"))
 JL_WINDOW = float(os.environ.get("JL_WINDOW", "2"))
 JL_COOLDOWN = float(os.environ.get("JL_COOLDOWN", "10"))
@@ -2052,11 +2053,34 @@ def jl_sigma(asset):
     return max(2e-5, math.sqrt(sum(r) / len(r)))
 
 
+jl_open_cache = {}
+
+
+def jl_open(asset, tf, open_ts, fetch=False):
+    """window start price: what the scanner saw at the open, else the Binance 1m open at that minute.
+    Only the resolver thread fetches (fetch=True), so the snapshot thread never waits on the network."""
+    op = open_ref.get((tf, open_ts), {}).get(asset)
+    if op:
+        return op
+    k = (asset, tf, open_ts)
+    if fetch and (k not in jl_open_cache or (jl_open_cache[k] is None and time.time() > open_ts + 90)):
+        jl_open_cache[k] = None
+        try:
+            ks = _klines(f"{asset}USDT", "1m", int(open_ts) * 1000, int(open_ts) * 1000 + 59000, 1)
+            if ks:
+                jl_open_cache[k] = float(ks[0][1])
+        except Exception as e:
+            log.warning(f"[JL] open price {k}: {e}")
+        for kk in [kk for kk in jl_open_cache if kk[2] + kk[1] * 60 < time.time() - 3600]:
+            jl_open_cache.pop(kk, None)
+    return jl_open_cache.get(k)
+
+
 def jl_fair_up(asset, tf, open_ts, now):
     """model chance (0-100) that UP wins, from the coin's move since the window opened"""
-    if asset == MM_ASSET:
+    if asset == MM_ASSET and tf in JL_MM_TFS:
         return mm_fair_up(tf, open_ts, now)
-    op = open_ref.get((tf, open_ts), {}).get(asset)
+    op = jl_open(asset, tf, open_ts)
     px = prices_ref.get(asset)
     left = open_ts + tf * 60 - now
     if not op or not px or left <= 0:
@@ -2098,12 +2122,11 @@ def jl_books_now(asset):
                 if open_ts <= now < open_ts + tf * 60:
                     live.setdefault((tf, open_ts), {})[side] = tok
             for (tf, open_ts), toks in live.items():
-                if "UP" in toks and "DOWN" in toks:
+                if tf in JL_MM_TFS and tf in JL_TFS and "UP" in toks and "DOWN" in toks:
                     bu, bd = mm_books.get(toks["UP"]), mm_books.get(toks["DOWN"])
                     ua, da = _jl_best(bu, "asks"), _jl_best(bd, "asks")
                     out.append((tf, open_ts, _jl_best(bu, "bids"), ua, _jl_best(bd, "bids"), da,
                                 _jl_depth(bu, ua), _jl_depth(bd, da), _jl_ladder(bu, bd)))
-        return out
     with jl_book_lock:
         for (a, tf, open_ts), (u, d) in jl_tok.items():
             if a != asset or not (open_ts <= now < open_ts + tf * 60):
@@ -2116,14 +2139,17 @@ def jl_books_now(asset):
 
 
 def jl_resolver_worker():
-    """find the current + next 5m/15m markets for the extra coins"""
+    """find the current + next markets the jump logger watches (all but BTC 5m/15m, which the MM feed has)"""
     while True:
         try:
             now = time.time()
             for a in JL_ASSETS:
-                if a == MM_ASSET and MM_ENABLED:
-                    continue
                 for tf in JL_TFS:
+                    cur = window_times(tf, now)[0]
+                    if now >= cur + 60:
+                        jl_open(a, tf, cur, fetch=True)     # strike for the fair-price model
+                    if a == MM_ASSET and MM_ENABLED and tf in JL_MM_TFS:
+                        continue
                     for o in (window_times(tf, now)[0], window_times(tf, now + 60)[0]):
                         if (a, tf, o) in jl_tok:
                             continue
@@ -2289,10 +2315,10 @@ def jl_text():
     # sell at the +5s bid; taker fee both ways. Only when the ask is 5-95c.
     #   calm = 5+ min since that coin's previous jump · edge = model fair price minus the ask we pay
     vers = [("every jump", lambda x, e, g: True),
-            ("calm 5+ min + <85c", lambda x, e, g: g > 300 and x < 85),
-            ("edge 10+ + <85c", lambda x, e, g: e is not None and e >= 10 and x < 85),
+            ("calm 5+ min + &lt;85c", lambda x, e, g: g > 300 and x < 85),
+            ("edge 10+ + &lt;85c", lambda x, e, g: e is not None and e >= 10 and x < 85),
             ("edge 20+", lambda x, e, g: e is not None and e >= 20)]
-    tot = {(a, k): [0.0, 0, 0] for a in JL_ASSETS for k, _ in vers}
+    tot = {(a, tf, k): [0.0, 0, 0] for a in JL_ASSETS for tf in JL_TFS for k, _ in vers}
     t0s = {}
     for (a, jid, t2), snaps in ev.items():
         if 0.0 in snaps:
@@ -2305,7 +2331,7 @@ def jl_text():
             prev = t0
     for (a, jid, t2), snaps in ev.items():
         a_s, b_s, z_s = snaps.get(0.25), snaps.get(5.0), snaps.get(0.0)
-        if not a_s or not b_s or not z_s or a not in JL_ASSETS:
+        if not a_s or not b_s or not z_s or a not in JL_ASSETS or t2 not in JL_TFS:
             continue
         up = a_s["bps"] > 0
         x = a_s["up_ask"] if up else a_s["dn_ask"]
@@ -2321,15 +2347,18 @@ def jl_text():
         pnl = sh * b / 100.0 - stake - fee_for(sh, x / 100.0) - fee_for(sh, b / 100.0)
         for k, f in vers:
             if f(x, e, g):
-                tt = tot[(a, k)]
+                tt = tot[(a, t2, k)]
                 tt[0] += pnl
                 tt[1] += 1
                 tt[2] += pnl > 0
     lines.append(f"<b>paper sniper</b> · last 24h · buy at +0.25s ask, sell at +5s bid, ${JL_STAKE:g}, after fees:")
     for a in JL_ASSETS:
-        lines.append(f"{a}: " + " · ".join(
-            f"{k} {n} tr {money(v)}" + (f" ({w * 100 // n}% win)" if n else "")
-            for k, _ in vers for v, n, w in [tot[(a, k)]]))
+        for tf in JL_TFS:
+            if not any(tot[(a, tf, k)][1] for k, _ in vers):
+                continue
+            lines.append(f"{a} {label_for(tf)}: " + " · ".join(
+                f"{k} {n} tr {money(v)}" + (f" ({w * 100 // n}% win)" if n else "")
+                for k, _ in vers for v, n, w in [tot[(a, tf, k)]]))
     lines.append("a rising ask after the jump = Polymarket was slow (a chance to buy before it moves)")
     return "\n".join(lines)
 
