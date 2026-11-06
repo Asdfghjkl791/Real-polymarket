@@ -54,6 +54,8 @@
 #   SETTLE_TIMEOUT_SECS=1800
 
 import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
+rec = None                             # Nov 5 2026: paper-only recorder, built by _make_rec() in main()
+_REC_ERR = ''
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -1290,6 +1292,8 @@ def run_command(t, args=()):
     if isinstance(args, str):
         args = args.split()
     arg = args[0] if args else ""
+    if rec is not None and rec.handle(t, args):       # /recexport /recwinexport /recstatus
+        return
     tf, band = parse_args(args)
     if t == "/stats":
         tg(stats_text("all" if arg == "all" else "today"), force=True)
@@ -1433,6 +1437,7 @@ def run_command(t, args=()):
            "add a band to timing/coins/hours: <code>/timing 15m 15-20</code>\n"
            "/status — open positions\n/export — trades CSV\n"
            "/exportscans [days] — raw shadow scans (gz)\n/exportmkts — outcomes CSV\n"
+           + (rec.HELP.lstrip("\n") + "\n" if rec is not None else "") +
            "/history1d [days] — past daily (24h) markets: prices + outcomes (default 60)\n"
            "/history 4h|1h|15m [days] — past markets for that timeframe\n"
            "/history 5m [days] — past 5m markets, weekday mornings 8:30-11:30 ET only\n"
@@ -2378,6 +2383,921 @@ def mm_start():
 
 
 
+
+# ══ RECORDER (paper only, Nov 5 2026): ETH 5m/15m/1h/4h + BTC 1h/4h — same factors as the 50secmaker BTC logger ══
+def _make_rec():
+    # rec.py — PAPER-ONLY recorder for the longshot bot (added Nov 5 2026). Never trades, never needs a private key.
+    #
+    # Records, for the markets in REC_PLAN (default: BTC 1h + 4h, ETH 5m + 15m + 1h + 4h), the same things the BTC
+    # early logger in 50secmaker records, so the D rules / jump rules can be tested on ETH and on 1h / 4h:
+    #   moves  : every fast move (>= 2bp and >= 3bp within 2s on a Binance feed, 10s cooldown per level and direction) of
+    #            BTC / ETH -> for every live market of that coin: both sides' books at 0 / 0.1 / 0.25 / 0.5 / 1 / 2 / 5 / 10s,
+    #            fair prices (our 15-min vol and Deribit vol; vs the Binance open, the Chainlink open and the 60s-TWAP rule),
+    #            Binance futures + spot trade flow, liquidations, order-book imbalance, other exchanges (lead), ETH/BTC/SOL
+    #            moves, Polymarket trades on both sides. Saved only when some side is >= 5c away from a fair price.
+    #   win    : every 5s (5m/15m), 15s (1h), 30s (4h): both books (top 3), prices, fair prices, TWAP start price
+    #   misc   : once a minute Binance futures stats + Deribit options summary per coin; market rules text per window
+    #   mkts   : every market's start prices, Chainlink close, our own TWAP close and Polymarket's official result
+    # Telegram (through the longshot bot):  /recexport [all]   /recwinexport [all]   /recstatus
+    # Env: REC_ON (true), REC_PLAN ("BTC:60,240;ETH:5,15,60,240"), REC_LEVELS ("2,3"), REC_KEEP_DAYS (7)
+    #      optional REC_POLY_API_KEY / REC_POLY_API_SECRET / REC_POLY_API_PASSPHRASE -> also records Polymarket's own TWAP feed
+    import os, time, json, math, sqlite3, threading, logging, gzip, io, csv
+    from collections import deque
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    import requests
+    import websocket
+
+    log = logging.getLogger("rec")
+    ET = ZoneInfo("America/New_York")
+    ON = os.environ.get("REC_ON", "true").strip().lower() in ("1", "true", "yes", "on")
+    PLAN = {}
+    for part in os.environ.get("REC_PLAN", "BTC:60,240;ETH:5,15,60,240").split(";"):
+        if ":" in part:
+            a, tfs = part.split(":", 1)
+            PLAN[a.strip().upper()] = [int(x) for x in tfs.split(",") if x.strip()]
+    ASSETS = list(PLAN)
+    FEAT = sorted(set(ASSETS) | {"BTC", "ETH", "SOL"})            # coins whose prices we follow (SOL only as a side feature)
+    LEVELS = sorted(float(x) for x in os.environ.get("REC_LEVELS", "2,3").split(",") if x.strip())
+    KEEP_DAYS = float(os.environ.get("REC_KEEP_DAYS", "7"))
+    SNAPS = (0, 0.1, 0.25, 0.5, 1, 2, 5, 10)
+    WIN_EVERY = {5: 5, 15: 5, 60: 15, 240: 30}
+    SYM = {"BTC": "btcusdt", "ETH": "ethusdt", "SOL": "solusdt"}
+    FULL = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+    GAMMA = "https://gamma-api.polymarket.com"
+    PM_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    RTDS = "wss://ws-live-data.polymarket.com"
+    POLYBOLT = "wss://ws-live-v2.polymarket.com/ws"
+    DERIBIT = "https://www.deribit.com/api/v2/public"
+    FAPI = "https://fapi.binance.com"
+    KLINES = "https://data-api.binance.vision/api/v3/klines"
+
+    H = {}                                  # db path, tg, tg_document (set by start)
+    lock = threading.RLock()
+    px = {a: {} for a in FEAT}               # px[asset][venue] = deque((t, mid))
+    px1s = {a: deque(maxlen=4000) for a in FEAT}
+    cl = {a: deque(maxlen=20000) for a in FEAT}          # (chainlink_ts, received_ts, value)
+    tw_feed = {a: deque(maxlen=20000) for a in FEAT}     # Polymarket TWAP feed if creds given: (ts, value)
+    flow = {a: {"fut": deque(maxlen=30000), "spot": deque(maxlen=30000)} for a in FEAT}   # (t, signed qty, price)
+    liq = {a: deque(maxlen=3000) for a in FEAT}          # (t, signed usd)   + = shorts forced to buy
+    imb = {a: {"fut": deque(maxlen=3000), "spot": deque(maxlen=3000)} for a in FEAT}     # (t, imb10, imb20)
+    ivs = {a: {"ts": 0, "iv": None, "skew1": None} for a in FEAT}
+    markets = {}                             # (asset, tf, o) -> {"up":tok, "dn":tok, "slug":..}
+    opens = {}                               # (asset, tf, o) -> {"bn":..., "cl":...}
+    books = {}                               # token -> {"asks":{px:sz}, "bids":{px:sz}}
+    pm_trades = deque(maxlen=40000)          # (t, token, price_c, size, side)
+    st = {"moves": 0, "saved": 0, "win": 0, "misc": 0, "err": {}, "pm": 0, "started": time.time()}
+    last_trig = {}
+
+
+    def _err(k, e):
+        st["err"][k] = f"{time.strftime('%H:%M', time.localtime())} {str(e)[:120]}"
+
+
+    # ── storage ───────────────────────────────────────────────────────────────────
+    _dbl = threading.Lock()
+
+
+    def db():
+        c = sqlite3.connect(H["db"], timeout=30)
+        c.execute("PRAGMA journal_mode=WAL")
+        return c
+
+
+    def dbx(sql, args=()):
+        with _dbl:
+            c = db()
+            try:
+                c.execute(sql, args)
+                c.commit()
+            finally:
+                c.close()
+
+
+    def dbq(sql, args=()):
+        with _dbl:
+            c = db()
+            try:
+                return c.execute(sql, args).fetchall()
+            finally:
+                c.close()
+
+
+    def init_db():
+        for s in ("CREATE TABLE IF NOT EXISTS rec_moves (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, asset TEXT, level REAL, feed TEXT, data TEXT)",
+                  "CREATE TABLE IF NOT EXISTS rec_win (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, asset TEXT, tf INTEGER, o INTEGER, data TEXT)",
+                  "CREATE TABLE IF NOT EXISTS rec_misc (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, asset TEXT, data TEXT)",
+                  "CREATE TABLE IF NOT EXISTS rec_mkts (asset TEXT, tf INTEGER, o INTEGER, data TEXT, outcome TEXT, PRIMARY KEY (asset, tf, o))",
+                  "CREATE TABLE IF NOT EXISTS rec_kv (k TEXT PRIMARY KEY, v TEXT)",
+                  "CREATE INDEX IF NOT EXISTS rec_moves_t ON rec_moves (t0)", "CREATE INDEX IF NOT EXISTS rec_win_t ON rec_win (ts)"):
+            dbx(s)
+
+
+    def J(x):
+        return json.dumps(x, separators=(",", ":"), default=str)
+
+
+    # ── windows / markets ─────────────────────────────────────────────────────────
+    def window(tf, now):
+        if tf == 60:
+            e = datetime.fromtimestamp(now, tz=ET).replace(minute=0, second=0, microsecond=0)
+            return int(e.timestamp())
+        if tf == 240:
+            e = datetime.fromtimestamp(now, tz=ET)
+            return int(e.replace(hour=(e.hour // 4) * 4, minute=0, second=0, microsecond=0).timestamp())
+        return int(now // (tf * 60)) * tf * 60
+
+
+    def slug(asset, tf, o):
+        if tf == 240:
+            return f"{asset.lower()}-updown-4h-{o}"
+        if tf == 60:
+            d = datetime.fromtimestamp(o, tz=ET)
+            h12 = d.strftime("%I").lstrip("0") or "12"
+            return f"{FULL[asset]}-up-or-down-{d.strftime('%B').lower()}-{d.day}-{d.year}-{h12}{d.strftime('%p').lower()}-et"
+        return f"{asset.lower()}-updown-{tf}m-{o}"
+
+
+    def _gamma_event(s):
+        arr = requests.get(f"{GAMMA}/events", params={"slug": s}, timeout=10).json()
+        return arr[0] if isinstance(arr, list) and arr else (arr if isinstance(arr, dict) else {})
+
+
+    def market_worker():
+        miss = {}
+        while True:
+            try:
+                now = time.time()
+                for a, tfs in PLAN.items():
+                    for tf in tfs:
+                        o = window(tf, now)
+                        k = (a, tf, o)
+                        if k in markets or now - miss.get(k, 0) < 20:
+                            continue
+                        ev = _gamma_event(slug(a, tf, o))
+                        mk = (ev.get("markets") or [{}])[0]
+                        toks = json.loads(mk.get("clobTokenIds") or "[]")
+                        if len(toks) == 2:
+                            with lock:
+                                markets[k] = {"up": str(toks[0]), "dn": str(toks[1]), "slug": slug(a, tf, o)}
+                            dbx("INSERT OR IGNORE INTO rec_mkts (asset, tf, o, data) VALUES (?,?,?,?)", (a, tf, o, J({"slug": slug(a, tf, o), "up": toks[0], "dn": toks[1]})))
+                            info = {kk: (v[:1500] if isinstance(v, str) else v) for kk, v in {**ev, **mk}.items()
+                                    if any(w in kk.lower() for w in ("description", "resolution", "price", "metadata", "start", "end", "question", "title"))}
+                            dbx("INSERT INTO rec_misc (ts, kind, asset, data) VALUES (?,?,?,?)", (now, "meta", a, J({"tf": tf, "o": o, "info": info})))
+                        else:
+                            miss[k] = now
+                with lock:                                  # drop markets 2 min after they close
+                    for k in [k for k in markets if k[2] + k[1] * 60 + 120 < now]:
+                        markets.pop(k, None)
+                if len(miss) > 5000:
+                    miss.clear()
+            except Exception as e:
+                _err("markets", e)
+            time.sleep(5)
+
+
+    def open_worker():
+        """Binance 1m open at the window start (vis REST) and the first Chainlink tick at/after the start"""
+        while True:
+            try:
+                now = time.time()
+                with lock:
+                    ks = list(markets)
+                for k in ks:
+                    a, tf, o = k
+                    d = opens.setdefault(k, {})
+                    if "bn" not in d and now >= o + 3:
+                        j = requests.get(KLINES, params={"symbol": SYM[a].upper(), "interval": "1m", "startTime": o * 1000, "limit": 1}, timeout=8).json()
+                        if j and int(j[0][0]) == o * 1000:
+                            d["bn"] = float(j[0][1])
+                    if "cl" not in d:
+                        t = next((v for ts, rt, v in list(cl[a]) if o <= ts < o + 5), None)
+                        if t:
+                            d["cl"] = t
+                    if "tw" not in d and now >= o + 1:
+                        v = next((v for ts, v in list(tw_feed[a]) if abs(ts - o) < 0.5), None)
+                        if v:
+                            d["tw"] = v
+                for k in [k for k in opens if k[2] + k[1] * 60 + 3600 < now]:
+                    opens.pop(k, None)
+            except Exception as e:
+                _err("opens", e)
+            time.sleep(2)
+
+
+    def outcome_worker():
+        """after each window closes: Polymarket's official result + our own Chainlink close and TWAP close"""
+        while True:
+            try:
+                now = time.time()
+                rows = dbq("SELECT asset, tf, o, data FROM rec_mkts WHERE outcome IS NULL AND o + tf * 60 < ? AND o + tf * 60 > ?", (now - 60, now - 3 * 86400))
+                for a, tf, o, data in rows[:40]:
+                    d = json.loads(data or "{}")
+                    e = o + tf * 60
+                    if "cl_close" not in d:
+                        t = next((v for ts, rt, v in list(cl[a]) if e <= ts < e + 5), None)
+                        pts = [v for ts, rt, v in list(cl[a]) if e - 62 <= ts <= e - 3]
+                        if t:
+                            d["cl_close"] = t
+                        if len(pts) >= 20:
+                            d["tw_close_ours"] = sum(pts) / len(pts)
+                        v = next((v for ts, v in list(tw_feed[a]) if abs(ts - e) < 0.5), None)
+                        if v:
+                            d["tw_close_feed"] = v
+                        op = opens.get((a, tf, o)) or {}
+                        d.update({"open_" + kk: vv for kk, vv in op.items()})
+                        k_, src = tw_strike(a, tf, o)
+                        d["tw_open"], d["tw_src"] = k_, src
+                    ev = _gamma_event(d.get("slug") or slug(a, tf, o))
+                    mk = (ev.get("markets") or [{}])[0]
+                    try:
+                        op_ = [float(x) for x in json.loads(mk.get("outcomePrices") or "[]")]
+                    except Exception:
+                        op_ = []
+                    oc = None
+                    if len(op_) == 2 and max(op_) >= 0.99:
+                        oc = "UP" if op_[0] > op_[1] else "DOWN"
+                    dbx("UPDATE rec_mkts SET data=?, outcome=? WHERE asset=? AND tf=? AND o=?", (J(d), oc, a, tf, o))
+                    time.sleep(0.3)
+            except Exception as e:
+                _err("outcomes", e)
+            time.sleep(30)
+
+
+    # ── price feeds ───────────────────────────────────────────────────────────────
+    def _push(a, venue, p, now=None, every=0.05):
+        if not p or p <= 0:
+            return
+        now = now or time.time()
+        q = px[a].setdefault(venue, deque(maxlen=20000))
+        if not q or now - q[-1][0] >= every:
+            q.append((now, p))
+
+
+    def _run_ws(name, url, on_msg, subs=None, ping=None, ping_every=15, timeout=30):
+        while True:
+            try:
+                ws = websocket.create_connection(url, timeout=10)
+                ws.settimeout(timeout)
+                for s in (subs or []):
+                    ws.send(s if isinstance(s, str) else json.dumps(s))
+                log.info(f"rec {name} connected")
+                lp = time.time()
+                while True:
+                    if ping and time.time() - lp > ping_every:
+                        ws.send(ping if isinstance(ping, str) else json.dumps(ping))
+                        lp = time.time()
+                    raw = ws.recv()
+                    if not raw or raw in ("pong", "PONG") or raw[0] not in "{[":
+                        continue
+                    on_msg(json.loads(raw))
+            except Exception as e:
+                _err(name, e)
+            time.sleep(5)
+
+
+    def binance_book_worker(venue):
+        url = {"vis": "wss://data-stream.binance.vision/stream?streams=",
+               "spot": "wss://stream.binance.com:9443/stream?streams=",
+               "fut": "wss://fstream.binance.com/stream?streams="}[venue] + "/".join(f"{SYM[a]}@bookTicker" for a in FEAT)
+        rev = {v.upper(): k for k, v in SYM.items()}
+
+        def on(m):
+            d = m.get("data") or {}
+            a = rev.get(str(d.get("s", "")).upper())
+            if not a:
+                return
+            now = time.time()
+            p = (float(d["b"]) + float(d["a"])) / 2
+            _push(a, venue, p, now, every=0.02)
+            if venue == "vis" and (not px1s[a] or now - px1s[a][-1][0] >= 1):
+                px1s[a].append((now, p))
+            if a in PLAN:
+                check_trigger(a, venue, now)
+        _run_ws("binance_" + venue, url, on)
+
+
+    def flow_worker(kind):
+        if kind == "futm":
+            url = "wss://fstream.binance.com/market/stream?streams=" + "/".join(f"{SYM[a]}@aggTrade/{SYM[a]}@forceOrder" for a in ASSETS)
+        elif kind == "futd":
+            url = "wss://fstream.binance.com/stream?streams=" + "/".join(f"{SYM[a]}@depth20@100ms" for a in ASSETS)
+        else:
+            url = "wss://stream.binance.com:9443/stream?streams=" + "/".join(f"{SYM[a]}@aggTrade/{SYM[a]}@depth20@100ms" for a in ASSETS)
+        rev = {v: k for k, v in SYM.items()}
+        venue = "spot" if kind == "spot" else "fut"
+
+        def on(m):
+            s = str(m.get("stream", ""))
+            a = rev.get(s.split("@")[0])
+            d = m.get("data") or {}
+            if not a:
+                return
+            now = time.time()
+            if "@aggTrade" in s:
+                q = float(d["q"]) * (-1 if d.get("m") else 1)          # buyer is maker -> seller hit the bid
+                flow[a][venue].append((now, q, float(d["p"])))
+            elif "@forceOrder" in s:
+                o = d.get("o") or {}
+                usd = float(o.get("q", 0)) * float(o.get("ap") or o.get("p") or 0)
+                liq[a].append((now, usd if o.get("S") == "BUY" else -usd))
+            elif "@depth" in s:
+                bids = d.get("b") or d.get("bids") or []
+                asks = d.get("a") or d.get("asks") or []
+                def side(lv, n):
+                    return sum(float(x[1]) for x in lv[:n])
+                b10, a10, b20, a20 = side(bids, 10), side(asks, 10), side(bids, 20), side(asks, 20)
+                q = imb[a][venue]
+                if not q or now - q[-1][0] >= 0.1:
+                    q.append((now, (b10 - a10) / max(1e-9, b10 + a10), (b20 - a20) / max(1e-9, b20 + a20)))
+        _run_ws("flow_" + kind, url, on)
+
+
+    def lead_worker(v):
+        cs = [a for a in FEAT if a in ("BTC", "ETH", "SOL")]
+        if v == "bybit":
+            url, subs, ping = "wss://stream.bybit.com/v5/public/linear", [{"op": "subscribe", "args": [f"orderbook.1.{a}USDT" for a in cs]}], {"op": "ping"}
+        elif v == "okx":
+            url, subs, ping = "wss://ws.okx.com:8443/ws/v5/public", [{"op": "subscribe", "args": [{"channel": "bbo-tbt", "instId": f"{a}-USDT-SWAP"} for a in cs]}], "ping"
+        elif v == "hl":
+            url, subs, ping = "wss://api.hyperliquid.xyz/ws", [{"method": "subscribe", "subscription": {"type": "bbo", "coin": a}} for a in cs], {"method": "ping"}
+        elif v == "kraken":
+            url, subs, ping = "wss://ws.kraken.com/v2", [{"method": "subscribe", "params": {"channel": "ticker", "symbol": [f"{a}/USD" for a in cs], "event_trigger": "bbo"}}], {"method": "ping"}
+        elif v == "bitstamp":
+            url, subs, ping = "wss://ws.bitstamp.net", [{"event": "bts:subscribe", "data": {"channel": f"order_book_{a.lower()}usd"}} for a in cs], None
+        else:   # coinbase
+            url, subs, ping = "wss://ws-feed.exchange.coinbase.com", [{"type": "subscribe", "product_ids": [f"{a}-USD" for a in cs], "channels": ["ticker"]}], None
+        bb = {}
+
+        def on(m):
+            now = time.time()
+            if v == "bybit":
+                a = str(m.get("topic", "")).replace("orderbook.1.", "").replace("USDT", "")
+                d = m.get("data") or {}
+                if a not in px or not d:
+                    return
+                b = bb.setdefault(a, [None, None])
+                if d.get("b") and float(d["b"][0][1]) > 0:
+                    b[0] = float(d["b"][0][0])
+                if d.get("a") and float(d["a"][0][1]) > 0:
+                    b[1] = float(d["a"][0][0])
+                if b[0] and b[1]:
+                    _push(a, v, (b[0] + b[1]) / 2, now)
+            elif v == "okx":
+                a = str((m.get("arg") or {}).get("instId", "")).split("-")[0]
+                for d in m.get("data") or []:
+                    if a in px and d.get("bids") and d.get("asks"):
+                        _push(a, v, (float(d["bids"][0][0]) + float(d["asks"][0][0])) / 2, now)
+            elif v == "hl":
+                d = m.get("data") or {}
+                if isinstance(d, dict) and d.get("coin") in px and d.get("bbo") and all(d["bbo"]):
+                    _push(d["coin"], v, (float(d["bbo"][0]["px"]) + float(d["bbo"][1]["px"])) / 2, now)
+            elif v == "kraken":
+                if m.get("channel") == "ticker":
+                    for d in m.get("data") or []:
+                        a = str(d.get("symbol", "")).split("/")[0]
+                        if a in px and d.get("bid") and d.get("ask"):
+                            _push(a, v, (float(d["bid"]) + float(d["ask"])) / 2, now)
+            elif v == "bitstamp":
+                a = str(m.get("channel", "")).replace("order_book_", "").replace("usd", "").upper()
+                d = m.get("data") or {}
+                if a in px and d.get("bids") and d.get("asks"):
+                    _push(a, v, (float(d["bids"][0][0]) + float(d["asks"][0][0])) / 2, now)
+            else:
+                if m.get("type") == "ticker":
+                    a = str(m.get("product_id", "")).split("-")[0]
+                    if a in px and m.get("best_bid") and m.get("best_ask"):
+                        _push(a, "cb", (float(m["best_bid"]) + float(m["best_ask"])) / 2, now)
+        _run_ws("lead_" + v, url, on, subs, ping)
+
+
+    def _points(m):
+        out = []
+
+        def walk(x):
+            if isinstance(x, dict):
+                v, ts = x.get("value"), x.get("timestamp") or x.get("ts")
+                if v is not None and ts is not None:
+                    try:
+                        tsf = float(ts)
+                        out.append((tsf / 1000 if tsf > 1e11 else tsf, float(v), str(x.get("symbol", ""))))
+                        return
+                    except (TypeError, ValueError):
+                        pass
+                for k in ("payload", "data", "snapshot"):
+                    if k in x:
+                        walk(x[k])
+            elif isinstance(x, list):
+                for y in x:
+                    walk(y)
+        walk(m)
+        return out
+
+
+    def chainlink_worker():
+        """Polymarket's public live-data feed of the Chainlink prices the 5m/15m markets settle on"""
+        subs = [{"action": "subscribe", "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "*", "filters": json.dumps({"symbol": f"{a.lower()}/usd"})} for a in FEAT]}]
+        sym = {f"{a.lower()}/usd": a for a in FEAT}
+
+        def on(m):
+            now = time.time()
+            top = str((m.get("payload") or {}).get("symbol", "")).lower() if isinstance(m.get("payload"), dict) else ""
+            for ts, v, s in _points(m):
+                a = sym.get((s or top).lower())
+                if not a:
+                    continue
+                q = cl[a]
+                if not q or ts > q[-1][0]:
+                    q.append((ts, now, v))
+                    _push(a, "cl", v, now, every=0)
+        _run_ws("chainlink", RTDS, on, subs, "PING", ping_every=5)
+
+
+    def twap_feed_worker():
+        """only with REC_POLY_API_* set: Polymarket's own 60s TWAP feed (PolyBolt, needs API creds)"""
+        k, s, p = (os.environ.get(x, "") for x in ("REC_POLY_API_KEY", "REC_POLY_API_SECRET", "REC_POLY_API_PASSPHRASE"))
+        if not (k and s and p):
+            return
+        subs = [{"op": "auth", "rid": "a1", "auth": {"apiKey": k, "secret": s, "passphrase": p}},
+                {"op": "subscribe", "rid": "s1", "subscriptions": [{"channel": "price.crypto.twap", "filter": {"symbol": f"{a.lower()}usd", "window_seconds": 60}} for a in FEAT]}]
+        sym = {f"{a.lower()}usd": a for a in FEAT}
+
+        def on(m):
+            if "twap" not in str(m.get("channel", "")):
+                return
+            top = str(((m.get("payload") or {}) if isinstance(m.get("payload"), dict) else {}).get("symbol", "")).lower()
+            for ts, v, s_ in _points(m):
+                a = sym.get((s_ or top).lower())
+                if a and (not tw_feed[a] or ts > tw_feed[a][-1][0]):
+                    tw_feed[a].append((ts, v))
+        _run_ws("twap_feed", POLYBOLT, on, subs, None)
+
+
+    # ── Polymarket books ──────────────────────────────────────────────────────────
+    def pm_handle(data):
+        for m in (data if isinstance(data, list) else [data]):
+            if not isinstance(m, dict):
+                continue
+            st["pm"] += 1
+            et = m.get("event_type")
+            with lock:
+                if et == "book":
+                    books[str(m.get("asset_id"))] = {"bids": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
+                                                     "asks": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
+                elif et == "last_trade_price":
+                    try:
+                        pm_trades.append((time.time(), str(m.get("asset_id")), round(float(m.get("price", 0)) * 100, 2), float(m.get("size", 0)), str(m.get("side", "")).upper()))
+                    except (TypeError, ValueError):
+                        pass
+                elif et == "price_change":
+                    for ch in (m.get("price_changes") or m.get("changes") or []):
+                        tok = str(ch.get("asset_id") or m.get("asset_id"))
+                        b = books.setdefault(tok, {"bids": {}, "asks": {}})
+                        lvl = b["bids"] if str(ch.get("side", "")).upper() == "BUY" else b["asks"]
+                        p, sz = round(float(ch["price"]) * 100, 3), float(ch.get("size", 0))
+                        if sz <= 0:
+                            lvl.pop(p, None)
+                        else:
+                            lvl[p] = sz
+
+
+    def pm_worker():
+        while True:
+            try:
+                with lock:
+                    toks = tuple(sorted(t for v in markets.values() for t in (v["up"], v["dn"])))
+                if not toks:
+                    time.sleep(2)
+                    continue
+                ws = websocket.create_connection(PM_WS, timeout=10)
+                ws.settimeout(15)
+                ws.send(json.dumps({"assets_ids": list(toks), "type": "market"}))
+                lp = time.time()
+                while True:
+                    if time.time() - lp > 10:
+                        ws.send("PING")
+                        lp = time.time()
+                        with lock:
+                            cur = tuple(sorted(t for v in markets.values() for t in (v["up"], v["dn"])))
+                        if cur != toks:
+                            break
+                    raw = ws.recv()
+                    if raw and raw[0] in "{[":
+                        pm_handle(json.loads(raw))
+                ws.close()
+                with lock:
+                    for t in [t for t in books if t not in set(cur)]:
+                        books.pop(t, None)
+            except Exception as e:
+                _err("pm", e)
+                time.sleep(2)
+
+
+    def ladder(tok, n=5):
+        with lock:
+            b = books.get(tok) or {}
+            a = sorted((b.get("asks") or {}).items())[:n]
+            bi = sorted((b.get("bids") or {}).items(), reverse=True)[:n]
+        return [[p, round(s, 1)] for p, s in a], [[p, round(s, 1)] for p, s in bi]
+
+
+    # ── fair prices ───────────────────────────────────────────────────────────────
+    def ncdf(x):
+        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+    def sigma(a):
+        pts = [p for p in list(px1s[a]) if p[0] >= time.time() - 900]
+        r = [(math.log(y / x)) ** 2 / (t1 - t0) for (t0, x), (t1, y) in zip(pts, pts[1:]) if t1 > t0 and x > 0 and y > 0]
+        return max(2e-5, math.sqrt(sum(r) / len(r))) if len(r) >= 30 else None
+
+
+    def sigma_iv(a):
+        d = ivs.get(a) or {}
+        if not d.get("iv") or time.time() - d["ts"] > 600:
+            return None
+        return d["iv"] / 100 / math.sqrt(365 * 86400)
+
+
+    def last(a, venue, t=None):
+        q = px[a].get(venue)
+        if not q:
+            return None
+        if t is None:
+            return q[-1][1]
+        for tt, p in reversed(q):
+            if tt <= t:
+                return p
+        return None
+
+
+    def cl_now(a, t):
+        """Chainlink price brought up to time t with Binance's move since that tick arrived"""
+        H_ = [x for x in list(cl[a]) if x[1] <= t]
+        if not H_:
+            return None
+        ts, rt, v = H_[-1]
+        b0, b1 = last(a, "vis", rt), last(a, "vis", t)
+        return v * b1 / b0 if b0 and b1 else v
+
+
+    def tw_strike(a, tf, o):
+        d = opens.get((a, tf, o)) or {}
+        if d.get("tw"):
+            return d["tw"], "feed"
+        pts = [v for ts, rt, v in list(cl[a]) if o - 62 <= ts <= o - 3]
+        return (sum(pts) / len(pts), "cl") if len(pts) >= 20 else (None, None)
+
+
+    def fairs(a, tf, o, t):
+        """chance (0-100) UP wins, for 3 start prices x 2 vols: bn = Binance 1m open vs Binance now, cl = Chainlink open vs Chainlink now,
+        tw = the 60s-TWAP rule (start TWAP vs average Chainlink over the last minute)"""
+        out = {}
+        e = o + tf * 60
+        left = e - t
+        if left <= 0:
+            return out
+        op = opens.get((a, tf, o)) or {}
+        vols = {"o": sigma(a), "d": sigma_iv(a)}
+        pb, pc = last(a, "vis", t), cl_now(a, t)
+        for vn, s in vols.items():
+            if not s:
+                continue
+            if op.get("bn") and pb:
+                out["bn_" + vn] = round(100 * ncdf(math.log(pb / op["bn"]) / (s * math.sqrt(left))), 2)
+            if op.get("cl") and pc:
+                out["cl_" + vn] = round(100 * ncdf(math.log(pc / op["cl"]) / (s * math.sqrt(left))), 2)
+            k, _ = tw_strike(a, tf, o)
+            if k and pc:
+                A, B = e - 62, e - 3
+                known = [v for ts, rt, v in list(cl[a]) if A <= ts <= t] if t > A else []
+                f = min(1.0, (t - A) / (B - A)) if (t > A and known) else 0.0
+                if t >= B:
+                    out["tw_" + vn] = 100.0 if (sum(known) / len(known) if known else pc) >= k else 0.0
+                else:
+                    s0 = max(t, A)
+                    mean = (sum(known) / len(known) if known else pc) * f + pc * (1 - f)
+                    sd = (1 - f) * s * math.sqrt(max(1e-9, (s0 - t) + (B - s0) / 3.0))
+                    out["tw_" + vn] = round(100 * ncdf(math.log(mean / k) / sd), 2)
+        return out
+
+
+    # ── moves ─────────────────────────────────────────────────────────────────────
+    _chk = {}
+
+
+    def check_trigger(a, venue, now):
+        if now - _chk.get((a, venue), 0) < 0.05:
+            return
+        _chk[(a, venue)] = now
+        q = px[a].get(venue)
+        if not q or len(q) < 3:
+            return
+        p1 = q[-1][1]
+        p0 = next((p for t, p in q if t >= now - 2), None)
+        if not p0:
+            return
+        bps = (p1 / p0 - 1) * 1e4
+        for lv in reversed(LEVELS):                    # biggest level first; one capture per move
+            if abs(bps) >= lv:
+                k = (a, lv, 1 if bps > 0 else -1)
+                if now - last_trig.get(k, 0) >= 10:
+                    for l2 in LEVELS:
+                        if l2 <= lv:
+                            last_trig[(a, l2, 1 if bps > 0 else -1)] = now
+                    st["moves"] += 1
+                    threading.Thread(target=capture, args=(a, venue, lv, round(bps, 2), now), daemon=True).start()
+                return
+
+
+    def _move(a, venue, t0, dt, sg):
+        p0, p1 = last(a, venue, t0), last(a, venue, t0 + dt)
+        if not p0 or not p1:
+            return None
+        return round(((p1 / p0 - 1) if dt > 0 else (p0 / p1 - 1)) * 1e4 * sg, 2)
+
+
+    def features(a, t0, sg):
+        f = {}
+        for v in ("fut", "spot"):
+            T = [x for x in list(flow[a][v]) if t0 - 61 <= x[0] <= t0 + 1.01]
+            for lab, lo, hi in (("m60", -60, 0), ("m10", -10, 0), ("m2", -2, 0), ("p05", 0, 0.5), ("p1", 0, 1)):
+                z = [q for t, q, p in T if t0 + lo <= t < t0 + hi]
+                f[f"{v}_net_{lab}"] = round(sum(z) * sg, 3)
+                f[f"{v}_vol_{lab}"] = round(sum(abs(x) for x in z), 3)
+            L = [x for x in list(imb[a][v]) if x[0] <= t0 + 0.5]
+            at = lambda tt: next((x for x in reversed(L) if x[0] <= tt), None)
+            for lab, tt in (("0", t0), ("p05", t0 + 0.5)):
+                x = at(tt)
+                if x:
+                    f[f"{v}_imb10_{lab}"], f[f"{v}_imb20_{lab}"] = round(x[1] * sg, 3), round(x[2] * sg, 3)
+        Lq = [x for x in list(liq[a]) if t0 - 60 <= x[0] <= t0 + 1]
+        f["liq_net_m60"] = round(sum(u for t, u in Lq if t <= t0) * sg)
+        f["liq_tot_m60"] = round(sum(abs(u) for t, u in Lq if t <= t0))
+        f["liq_net_p1"] = round(sum(u for t, u in Lq if t > t0) * sg)
+        lead = {}
+        for v in list(px[a]):
+            r = {lab: _move(a, v, t0, dt, sg) for lab, dt in (("m10", -10), ("m2", -2), ("p05", 0.5), ("p1", 1), ("p2", 2))}
+            q = [x for x in list(px[a][v]) if t0 - 2 <= x[0] <= t0 + 3]
+            base = last(a, v, t0 - 2)
+            if base:
+                for lv in (1, 2, 3):
+                    hit = next((t for t, p in q if (p / base - 1) * 1e4 * sg >= lv), None)
+                    r[f"x{lv}"] = None if hit is None else round(hit - t0, 3)
+            p0, pv = last(a, v, t0), last(a, "vis", t0)
+            if p0 and pv:
+                r["gap"] = round((p0 / pv - 1) * 1e4, 2)
+            lead[v] = r
+        f["lead"] = lead
+        for b in FEAT:
+            if b != a:
+                for lab, dt in (("m60", -60), ("m10", -10), ("m2", -2), ("p05", 0.5), ("p1", 1)):
+                    f[f"{b.lower()}_{lab}"] = _move(b, "vis", t0, dt, sg)
+        return f
+
+
+    def capture(a, venue, lv, bps, t0):
+        try:
+            sg = 1 if bps > 0 else -1
+            with lock:
+                mk = [(k, v) for k, v in markets.items() if k[0] == a and k[2] <= t0 < k[2] + k[1] * 60]
+            if not mk:
+                return
+            rec = {"bps": bps, "feed": venue, "level": lv, "px": {v: last(a, v, t0) for v in list(px[a])}, "sig": sigma(a), "sig_iv": sigma_iv(a),
+                   "iv": ivs[a].get("iv"), "skew1": ivs[a].get("skew1"), "mk": {}}
+            for (a_, tf, o), m in mk:
+                ours, opp = (m["up"], m["dn"]) if sg > 0 else (m["dn"], m["up"])
+                fu = fairs(a, tf, o, t0)
+                k_, src = tw_strike(a, tf, o)
+                rec["mk"][str(tf)] = {"o": o, "left": round(o + tf * 60 - t0, 1), "open": opens.get((a, tf, o)), "tw_k": k_, "tw_src": src,
+                                      "fair_up": fu, "fair": {k: round(v if sg > 0 else 100 - v, 2) for k, v in fu.items()}, "s": {}, "x": {}}
+            for off in SNAPS:
+                dt = t0 + off - time.time()
+                if dt > 0:
+                    time.sleep(dt)
+                for (a_, tf, o), m in mk:
+                    ours, opp = (m["up"], m["dn"]) if sg > 0 else (m["dn"], m["up"])
+                    oa, ob = ladder(ours, 5 if off <= 2 else 3)
+                    xa, xb = ladder(opp, 3)
+                    rec["mk"][str(tf)]["s"][str(off)] = {"a": oa, "b": ob}
+                    rec["mk"][str(tf)]["x"][str(off)] = {"a": xa, "b": xb}
+            rec["f"] = features(a, t0, sg)
+            T = [x for x in list(pm_trades) if t0 - 10 <= x[0] <= t0 + 2]
+            keep = False
+            for (a_, tf, o), m in mk:
+                ours, opp = (m["up"], m["dn"]) if sg > 0 else (m["dn"], m["up"])
+                r = rec["mk"][str(tf)]
+                r["pm"] = {lab: [round(sum(s for t, k, p, s, sd in T if k == tok and t0 + lo <= t < t0 + hi), 1) for tok in (ours, opp)]
+                           for lab, lo, hi in (("m10", -10, 0), ("p1", 0, 1), ("p2", 0, 2))}
+                s0 = r["s"].get("0") or {}
+                x0 = r["x"].get("0") or {}
+                a0 = s0.get("a")[0][0] if s0.get("a") else None
+                x0a = x0.get("a")[0][0] if x0.get("a") else None
+                for v in r["fair"].values():
+                    if (a0 is not None and abs(v - a0) >= 5) or (x0a is not None and abs((100 - v) - x0a) >= 5):
+                        keep = True
+            if keep:
+                dbx("INSERT INTO rec_moves (t0, asset, level, feed, data) VALUES (?,?,?,?,?)", (t0, a, lv, venue, J(rec)))
+                st["saved"] += 1
+        except Exception as e:
+            _err("capture", e)
+
+
+    # ── window snapshots, minute stats ───────────────────────────────────────────
+    def win_worker():
+        lastw = {}
+        while True:
+            t = time.time()
+            try:
+                with lock:
+                    mk = [(k, v) for k, v in markets.items() if k[2] <= t < k[2] + k[1] * 60]
+                for (a, tf, o), m in mk:
+                    if t - lastw.get((a, tf, o), 0) < WIN_EVERY.get(tf, 30) - 0.5:
+                        continue
+                    lastw[(a, tf, o)] = t
+                    ua, ub = ladder(m["up"], 3)
+                    da, db_ = ladder(m["dn"], 3)
+                    k_, src = tw_strike(a, tf, o)
+                    rec = {"into": round(t - o, 1), "ua": ua, "ub": ub, "da": da, "db": db_, "px": {v: last(a, v) for v in ("vis", "fut", "cl", "cb")},
+                           "open": opens.get((a, tf, o)), "tw_k": k_, "tw_src": src, "tw_last": tw_feed[a][-1][1] if tw_feed[a] else None, "fair_up": fairs(a, tf, o, t),
+                           "pmv": [round(sum(s for tt, tok, p, s, sd in list(pm_trades)[-3000:] if tok == x and tt >= t - WIN_EVERY.get(tf, 30)), 1) for x in (m["up"], m["dn"])]}
+                    dbx("INSERT INTO rec_win (ts, asset, tf, o, data) VALUES (?,?,?,?,?)", (t, a, tf, o, J(rec)))
+                    st["win"] += 1
+                for k in [k for k in lastw if k[2] + k[1] * 60 < t - 60]:
+                    lastw.pop(k, None)
+            except Exception as e:
+                _err("win", e)
+            time.sleep(max(0.5, 1 - (time.time() - t)))
+
+
+    def _deribit(cur):
+        now = time.time()
+        opts = (requests.get(f"{DERIBIT}/get_book_summary_by_currency", params={"currency": cur, "kind": "option"}, timeout=15).json() or {}).get("result") or []
+        by = {}
+        for x in opts:
+            p = (x.get("instrument_name") or "").split("-")
+            if len(p) != 4 or not x.get("mark_iv"):
+                continue
+            try:
+                e = datetime.strptime(p[1], "%d%b%y").replace(hour=8, tzinfo=timezone.utc).timestamp()
+                K, F = float(p[2]), float(x.get("underlying_price") or 0)
+            except Exception:
+                continue
+            if e > now and F > 0:
+                by.setdefault(e, []).append((K, F, p[3], float(x["mark_iv"]), float(x.get("open_interest") or 0), float(x.get("volume") or 0)))
+        exps = []
+        for e in sorted(by)[:3]:
+            pts = by[e]
+            F = pts[0][1]
+            def iv_at(mm, kind):
+                c = [(abs(K / F - mm), iv) for K, F_, k, iv, oi, v in pts if k == kind]
+                return min(c)[1] if c else None
+            atm = [iv for K, F_, k, iv, oi, v in pts if abs(K / F - 1) <= 0.01] or [iv for _, iv in sorted((abs(K / F - 1), iv) for K, F_, k, iv, oi, v in pts)[:2]]
+            p1, c1 = iv_at(0.99, "P"), iv_at(1.01, "C")
+            exps.append({"hours": round((e - now) / 3600, 2), "F": F, "atm_iv": round(sum(atm) / len(atm), 2), "skew1": None if p1 is None or c1 is None else round(p1 - c1, 2),
+                         "put_oi": round(sum(oi for K, F_, k, iv, oi, v in pts if k == "P"), 1), "call_oi": round(sum(oi for K, F_, k, iv, oi, v in pts if k == "C"), 1)})
+        fut = (requests.get(f"{DERIBIT}/get_book_summary_by_currency", params={"currency": cur, "kind": "future"}, timeout=15).json() or {}).get("result") or []
+        perp = next((x for x in fut if x.get("instrument_name") == f"{cur}-PERPETUAL"), None) or {}
+        return {"exp": exps, "perp": {k: perp.get(k) for k in ("mark_price", "funding_8h", "open_interest")}}
+
+
+    def misc_worker():
+        while True:
+            t = time.time()
+            for a in ASSETS:
+                try:
+                    d = _deribit(a)
+                    if d["exp"]:
+                        near = next((x for x in d["exp"] if x["hours"] >= 1), d["exp"][0])
+                        ivs[a] = {"ts": t, "iv": near["atm_iv"], "skew1": near["skew1"]}
+                    dbx("INSERT INTO rec_misc (ts, kind, asset, data) VALUES (?,?,?,?)", (t, "deribit", a, J(d)))
+                except Exception as e:
+                    _err("deribit_" + a, e)
+                try:
+                    s = SYM[a].upper()
+                    out = {}
+                    for nm, path, prm in (("premium", "/fapi/v1/premiumIndex", {"symbol": s}), ("oi", "/fapi/v1/openInterest", {"symbol": s}),
+                                          ("taker", "/futures/data/takerlongshortRatio", {"symbol": s, "period": "5m", "limit": 1}),
+                                          ("lsr", "/futures/data/globalLongShortAccountRatio", {"symbol": s, "period": "5m", "limit": 1})):
+                        try:
+                            out[nm] = requests.get(FAPI + path, params=prm, timeout=8).json()
+                        except Exception as e:
+                            out[nm] = {"err": str(e)[:60]}
+                    dbx("INSERT INTO rec_misc (ts, kind, asset, data) VALUES (?,?,?,?)", (t, "binance", a, J(out)))
+                    st["misc"] += 1
+                except Exception as e:
+                    _err("binance_" + a, e)
+            if int(t) % 3600 < 60:
+                try:
+                    cut = t - KEEP_DAYS * 86400
+                    for tb, col in (("rec_moves", "t0"), ("rec_win", "ts"), ("rec_misc", "ts")):
+                        dbx(f"DELETE FROM {tb} WHERE {col} < ?", (cut,))
+                except Exception as e:
+                    _err("prune", e)
+            time.sleep(max(5, 60 - (time.time() - t)))
+
+
+    # ── Telegram (through the longshot bot) ──────────────────────────────────────
+    def _send(name, header, rows, caption):
+        """gzipped CSV; split into parts if over ~45 MB (Telegram's limit is 50 MB)"""
+        parts, n = [rows], 1
+        while True:
+            blobs = []
+            for p in parts:
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(header)
+                w.writerows(p)
+                blobs.append(gzip.compress(buf.getvalue().encode()))
+            if max(len(b) for b in blobs) < 45e6 or n >= 32:
+                break
+            n *= 2
+            k = math.ceil(len(rows) / n)
+            parts = [rows[i:i + k] for i in range(0, len(rows), k)]
+        for i, b in enumerate(blobs):
+            nm = name if len(blobs) == 1 else name.replace(".csv.gz", f"_part{i + 1}of{len(blobs)}.csv.gz")
+            H["tg_document"](nm, b, caption if len(blobs) == 1 else f"{caption} (part {i + 1}/{len(blobs)})", "application/gzip")
+
+
+    def _kv(k, v=None):
+        if v is None:
+            r = dbq("SELECT v FROM rec_kv WHERE k=?", (k,))
+            return int(r[0][0]) if r else 0
+        dbx("INSERT OR REPLACE INTO rec_kv (k, v) VALUES (?,?)", (k, str(v)))
+
+
+    def _age(q, i=0):
+        return f"{time.time() - q[-1][i]:.0f}s" if q else "none"
+
+
+    def handle(t, args=()):
+        """returns True if the command was ours"""
+        if t not in ("/recexport", "/recwinexport", "/recstatus"):
+            return False
+        if not ON or not H:
+            H.get("tg", print)("recorder is off (REC_ON)")
+            return True
+        allr = bool(args) and str(args[0]).lower() == "all"
+        if t == "/recstatus":
+            lines = [f"📼 recorder (paper only) · plan {' · '.join(f'{a} ' + '/'.join(str(x) + 'm' for x in tfs) for a, tfs in PLAN.items())}",
+                     f"moves seen {st['moves']} · saved {st['saved']} · window rows {st['win']} · minute stats {st['misc']} · PM msgs {st['pm']}",
+                     f"live markets {len(markets)} · PM books {len(books)} · PM trades {len(pm_trades)}"]
+            for a in FEAT:
+                lines.append(f"{a}: " + " ".join(f"{v} {_age(q)}" for v, q in sorted(px[a].items())) + f" · chainlink {_age(cl[a], 1)} · twap-feed {_age(tw_feed[a])}"
+                             + (f" · deribit iv {ivs[a]['iv']}" if ivs[a].get("iv") else "") + (f" · flow {_age(flow[a]['fut'])}/{_age(flow[a]['spot'])}" if a in ASSETS else ""))
+            if st["err"]:
+                lines.append("last errors: " + " | ".join(f"{k}: {v}" for k, v in list(st["err"].items())[-6:]))
+            H["tg"]("\n".join(lines).replace("<", "(").replace(">", ")"))
+            return True
+        if t == "/recexport":
+            since = 0 if allr else _kv("moves")
+            rows = dbq("SELECT id, t0, asset, level, feed, data FROM rec_moves WHERE id > ? ORDER BY id", (since,))
+            mk = dbq("SELECT asset, tf, o, outcome, data FROM rec_mkts ORDER BY o")
+            if rows:
+                _send("rec_moves.csv.gz", ["id", "t0", "asset", "level", "feed", "data"], [list(r) for r in rows], f"{len(rows)} moves (BTC/ETH, paper)")
+                _kv("moves", rows[-1][0])
+            else:
+                H["tg"]("no new moves yet")
+            _send("rec_mkts.csv.gz", ["asset", "tf", "open_ts", "outcome", "data"], [list(r) for r in mk], f"{len(mk)} markets")
+            return True
+        since_w = 0 if allr else _kv("win")
+        since_m = 0 if allr else _kv("misc")
+        rows = dbq("SELECT id, ts, asset, tf, o, data FROM rec_win WHERE id > ? ORDER BY id", (since_w,))
+        ms = dbq("SELECT id, ts, kind, asset, data FROM rec_misc WHERE id > ? ORDER BY id", (since_m,))
+        if rows:
+            _send("rec_win.csv.gz", ["id", "ts", "asset", "tf", "open_ts", "data"], [list(r) for r in rows], f"{len(rows)} window snapshots")
+            _kv("win", rows[-1][0])
+        if ms:
+            _send("rec_misc.csv.gz", ["id", "ts", "kind", "asset", "data"], [list(r) for r in ms], f"{len(ms)} minute stats / market info")
+            _kv("misc", ms[-1][0])
+        if not rows and not ms:
+            H["tg"]("no new window rows yet")
+        return True
+
+
+    HELP = "\n/recexport [all] — ETH + 1h/4h fast-move log + market results\n/recwinexport [all] — window snapshots + minute stats\n/recstatus — recorder health"
+
+
+    def start(db_path, tg, tg_document):
+        if not ON or H:
+            return
+        H.update(db=db_path, tg=tg, tg_document=tg_document)
+        init_db()
+        workers = [market_worker, open_worker, outcome_worker, pm_worker, chainlink_worker, twap_feed_worker, win_worker, misc_worker]
+        for fn in workers:
+            threading.Thread(target=fn, daemon=True).start()
+        for v in ("vis", "spot", "fut"):
+            threading.Thread(target=binance_book_worker, args=(v,), daemon=True).start()
+        for k in ("futm", "futd", "spot"):
+            threading.Thread(target=flow_worker, args=(k,), daemon=True).start()
+        for v in ("bybit", "okx", "hl", "kraken", "bitstamp", "coinbase"):
+            threading.Thread(target=lead_worker, args=(v,), daemon=True).start()
+        log.info(f"rec started: {PLAN}")
+
+    import types as _types
+    return _types.SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('_types')})
+
+
 def main():
     if not WEBSOCKET_AVAILABLE:
         log.error("websocket-client not installed")
@@ -2399,6 +3319,19 @@ def main():
         mm_start()
     except Exception as e:
         log.error(f"[MM] start failed: {e}")
+    global rec, _REC_ERR
+    try:
+        rec = _make_rec()
+    except Exception as e:
+        rec, _REC_ERR = None, str(e)
+    if rec is not None:
+        try:
+            rec.start(os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "rec.db"),
+                      lambda m: tg(m, force=True), tg_document)
+        except Exception as e:
+            log.error(f"[REC] start failed: {e}")
+    else:
+        log.error(f"[REC] recorder not built: {_REC_ERR}")
     while True:
         try:
             handle_commands()
