@@ -2390,7 +2390,7 @@ def _make_rec():
     #
     # Records, for the markets in REC_PLAN (default: BTC 1h + 4h, ETH 5m + 15m + 1h + 4h), the same things the BTC
     # early logger in 50secmaker records, so the D rules / jump rules can be tested on ETH and on 1h / 4h:
-    #   moves  : every fast move (>= 2bp and >= 3bp within 2s on a Binance feed, 10s cooldown per level and direction) of
+    #   moves  : every fast move (>= 2bp within 2s on a Binance feed, 10s cooldown per direction; 3bp kept as crossing times) of
     #            BTC / ETH -> for every live market of that coin: both sides' books at 0 / 0.1 / 0.25 / 0.5 / 1 / 2 / 5 / 10s,
     #            fair prices (our 15-min vol and Deribit vol; vs the Binance open, the Chainlink open and the 60s-TWAP rule),
     #            Binance futures + spot trade flow, liquidations, order-book imbalance, other exchanges (lead), ETH/BTC/SOL
@@ -2401,7 +2401,7 @@ def _make_rec():
     # Telegram (through the longshot bot):  /recexport [all]   /recwinexport [all]   /recstatus
     # Env: REC_ON (true), REC_PLAN ("BTC:60,240;ETH:5,15,60,240"), REC_LEVELS ("2,3"), REC_KEEP_DAYS (7)
     #      optional REC_POLY_API_KEY / REC_POLY_API_SECRET / REC_POLY_API_PASSPHRASE -> also records Polymarket's own TWAP feed
-    import os, time, json, math, sqlite3, threading, logging, gzip, io, csv
+    import os, time, json, math, sqlite3, threading, logging, gzip, io, csv, zlib
     from collections import deque
     from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
@@ -2495,6 +2495,12 @@ def _make_rec():
 
     def J(x):
         return json.dumps(x, separators=(",", ":"), default=str)
+
+    def Z(x):                                          # moves + window rows are stored compressed (about 5x smaller)
+        return zlib.compress(J(x).encode(), 6)
+
+    def UZ(b):
+        return zlib.decompress(b).decode() if isinstance(b, (bytes, bytearray)) else b
 
 
     # ── windows / markets ─────────────────────────────────────────────────────────
@@ -2998,16 +3004,13 @@ def _make_rec():
         if not p0:
             return
         bps = (p1 / p0 - 1) * 1e4
-        for lv in reversed(LEVELS):                    # biggest level first; one capture per move
-            if abs(bps) >= lv:
-                k = (a, lv, 1 if bps > 0 else -1)
-                if now - last_trig.get(k, 0) >= 10:
-                    for l2 in LEVELS:
-                        if l2 <= lv:
-                            last_trig[(a, l2, 1 if bps > 0 else -1)] = now
-                    st["moves"] += 1
-                    threading.Thread(target=capture, args=(a, venue, lv, round(bps, 2), now), daemon=True).start()
-                return
+        lv = LEVELS[0]                                 # ONE capture per move, at the first (smallest) level; a later 3bp crossing is
+        if abs(bps) >= lv:                             # kept in the lead data (x3 = when each feed crossed 3bp), so 3bp rules can be rebuilt
+            k = (a, 1 if bps > 0 else -1)
+            if now - last_trig.get(k, 0) >= 10:
+                last_trig[k] = now
+                st["moves"] += 1
+                threading.Thread(target=capture, args=(a, venue, lv, round(bps, 2), now), daemon=True).start()
 
 
     def _move(a, venue, t0, dt, sg):
@@ -3097,7 +3100,7 @@ def _make_rec():
                     if (a0 is not None and abs(v - a0) >= 5) or (x0a is not None and abs((100 - v) - x0a) >= 5):
                         keep = True
             if keep:
-                dbx("INSERT INTO rec_moves (t0, asset, level, feed, data) VALUES (?,?,?,?,?)", (t0, a, lv, venue, J(rec)))
+                dbx("INSERT INTO rec_moves (t0, asset, level, feed, data) VALUES (?,?,?,?,?)", (t0, a, lv, venue, Z(rec)))
                 st["saved"] += 1
         except Exception as e:
             _err("capture", e)
@@ -3121,7 +3124,7 @@ def _make_rec():
                     rec = {"into": round(t - o, 1), "ua": ua, "ub": ub, "da": da, "db": db_, "px": {v: last(a, v) for v in ("vis", "fut", "cl", "cb")},
                            "open": opens.get((a, tf, o)), "tw_k": k_, "tw_src": src, "tw_last": tw_feed[a][-1][1] if tw_feed[a] else None, "fair_up": fairs(a, tf, o, t),
                            "pmv": [round(sum(s for tt, tok, p, s, sd in list(pm_trades)[-3000:] if tok == x and tt >= t - WIN_EVERY.get(tf, 30)), 1) for x in (m["up"], m["dn"])]}
-                    dbx("INSERT INTO rec_win (ts, asset, tf, o, data) VALUES (?,?,?,?,?)", (t, a, tf, o, J(rec)))
+                    dbx("INSERT INTO rec_win (ts, asset, tf, o, data) VALUES (?,?,?,?,?)", (t, a, tf, o, Z(rec)))
                     st["win"] += 1
                 for k in [k for k in lastw if k[2] + k[1] * 60 < t - 60]:
                     lastw.pop(k, None)
@@ -3254,7 +3257,7 @@ def _make_rec():
             rows = dbq("SELECT id, t0, asset, level, feed, data FROM rec_moves WHERE id > ? ORDER BY id", (since,))
             mk = dbq("SELECT asset, tf, o, outcome, data FROM rec_mkts ORDER BY o")
             if rows:
-                _send("rec_moves.csv.gz", ["id", "t0", "asset", "level", "feed", "data"], [list(r) for r in rows], f"{len(rows)} moves (BTC/ETH, paper)")
+                _send("rec_moves.csv.gz", ["id", "t0", "asset", "level", "feed", "data"], [list(r[:5]) + [UZ(r[5])] for r in rows], f"{len(rows)} moves (BTC/ETH, paper)")
                 _kv("moves", rows[-1][0])
             else:
                 H["tg"]("no new moves yet")
@@ -3265,7 +3268,7 @@ def _make_rec():
         rows = dbq("SELECT id, ts, asset, tf, o, data FROM rec_win WHERE id > ? ORDER BY id", (since_w,))
         ms = dbq("SELECT id, ts, kind, asset, data FROM rec_misc WHERE id > ? ORDER BY id", (since_m,))
         if rows:
-            _send("rec_win.csv.gz", ["id", "ts", "asset", "tf", "open_ts", "data"], [list(r) for r in rows], f"{len(rows)} window snapshots")
+            _send("rec_win.csv.gz", ["id", "ts", "asset", "tf", "open_ts", "data"], [list(r[:5]) + [UZ(r[5])] for r in rows], f"{len(rows)} window snapshots")
             _kv("win", rows[-1][0])
         if ms:
             _send("rec_misc.csv.gz", ["id", "ts", "kind", "asset", "data"], [list(r) for r in ms], f"{len(ms)} minute stats / market info")
